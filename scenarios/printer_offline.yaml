@@ -1,0 +1,184 @@
+id: printer_offline
+title: "Printer Shows Offline — Jobs Stuck in Queue"
+category: printing
+system_template: windows_desktop
+shell: powershell
+description: >
+  Windows desktop user cannot print — the department printer shows "Offline" in
+  Windows and their documents just sit in the queue. The printer itself is powered
+  on and reachable on the network; the root cause is a stuck print job in an error
+  state at the head of the queue, which jams everything behind it and makes Windows
+  mark the printer offline. Restarting the Print Spooler service alone does NOT
+  clear it — spooled jobs persist across restarts. Correct T1 resolution is to
+  confirm the printer is reachable, find the stuck job with Get-PrintJob, remove it
+  with Remove-PrintJob, and verify the printer returns to Normal. This is a classic
+  T1 direct-fix scenario; escalating it would be unnecessary.
+
+available_commands:
+  - "ping <printer IP or name> — test whether the printer is reachable on the network"
+  - "Test-NetConnection <printer> -Port 9100 — test the raw print port"
+  - "Get-Printer — list printers and their status"
+  - "Get-PrintJob -PrinterName \"<name>\" — list jobs in a printer's queue"
+  - "Remove-PrintJob -PrinterName \"<name>\" -ID <id> — delete a job from the queue"
+  - "Get-Service spooler — check the Print Spooler service"
+  - "Restart-Service spooler — restart the Print Spooler service"
+
+initial_ticket:
+  subject: "Printer says offline, nothing will print"
+  body: |
+    The big printer by the copy room isn't working. I sent a report to it twice this
+    morning and nothing came out, and now it says "Offline" on my computer. The
+    printer screen itself looks normal and other people said their stuff isn't
+    printing either. I need to print handouts before my 2pm meeting.
+
+system_state:
+  hostname: "WS-117"
+  username: "dvasquez"
+  printer_name: "HP-M479-CopyRoom"
+  printer_ip: "192.168.4.61"
+
+commands:
+  - id: ping_printer
+    match_pattern: "^ping\\s+\\S+"
+    output: |
+      Pinging {target} [{printer_ip}] with 32 bytes of data:
+      Reply from {printer_ip}: bytes=32 time=2ms TTL=64
+      Reply from {printer_ip}: bytes=32 time=1ms TTL=64
+      Reply from {printer_ip}: bytes=32 time=1ms TTL=64
+      Reply from {printer_ip}: bytes=32 time=2ms TTL=64
+
+      Ping statistics for {printer_ip}:
+          Packets: Sent = 4, Received = 4, Lost = 0 (0% loss)
+    reveals: "printer_network_reachable"
+
+  # Red herring-adjacent: the raw print port is open too — the network path to
+  # the printer is fine, which should push the operator toward the queue itself.
+  - id: test_netconnection
+    match_pattern: "^Test-NetConnection\\b"
+    output: |
+      ComputerName     : {target}
+      RemoteAddress    : {printer_ip}
+      RemotePort       : 9100
+      InterfaceAlias   : Ethernet0
+      SourceAddress    : 192.168.4.117
+      TcpTestSucceeded : True
+    reveals: null
+
+  - id: get_printjob
+    match_pattern: "^Get-PrintJob\\b"
+    output: |
+      Id   PrinterName          DocumentName                 SubmittedTime         JobStatus
+      --   -----------          ------------                 -------------         ---------
+      12   {printer_name}    quarterly_labels.pdf         6/28/2026 7:41:02 AM  Error, Retained
+      13   {printer_name}    weekly_report.docx           6/28/2026 8:15:44 AM  Normal
+      14   {printer_name}    weekly_report.docx           6/28/2026 8:19:03 AM  Normal
+      15   {printer_name}    meeting_handouts.pptx        6/28/2026 8:52:17 AM  Normal
+    reveals: "stuck_job_found"
+    conditional_outputs:
+      - requires: stuck_job_cleared
+        output: |
+          Id   PrinterName          DocumentName                 SubmittedTime         JobStatus
+          --   -----------          ------------                 -------------         ---------
+          13   {printer_name}    weekly_report.docx           6/28/2026 8:15:44 AM  Printing
+          14   {printer_name}    weekly_report.docx           6/28/2026 8:19:03 AM  Normal
+          15   {printer_name}    meeting_handouts.pptx        6/28/2026 8:52:17 AM  Normal
+        reveals: "queue_moving_again"
+
+  - id: get_printer
+    match_pattern: "^Get-Printer\\b"
+    output: |
+      Name                 ComputerName    Type         DriverName                PortName        PrinterStatus
+      ----                 ------------    ----         ----------                --------        -------------
+      {printer_name}    PRINTSRV-01     Connection   HP Color LaserJet M479    IP_{printer_ip}  Offline
+      Microsoft Print to PDF               Local        Microsoft Print To PDF    PORTPROMPT:     Normal
+    reveals: "printer_shows_offline"
+    conditional_outputs:
+      - requires: stuck_job_cleared
+        output: |
+          Name                 ComputerName    Type         DriverName                PortName        PrinterStatus
+          ----                 ------------    ----         ----------                --------        -------------
+          {printer_name}    PRINTSRV-01     Connection   HP Color LaserJet M479    IP_{printer_ip}  Normal
+          Microsoft Print to PDF               Local        Microsoft Print To PDF    PORTPROMPT:     Normal
+        reveals: "fix_verified"
+
+  # The fix: remove the stuck job (ID 12) at the head of the queue. Removing a
+  # different job deletes someone's legitimate document and fixes nothing —
+  # that falls through to the generic pattern below.
+  - id: remove_printjob
+    match_pattern: "^Remove-PrintJob\\b.*\\b12\\b"
+    output: |
+      (no output — print job removed)
+    reveals: "stuck_job_cleared"
+
+  - id: remove_printjob_wrong_id
+    match_pattern: "^Remove-PrintJob\\b"
+    output: |
+      (no output — print job removed)
+    reveals: null
+
+  # The spooler is running fine — the problem is a job, not the service.
+  - id: get_service_spooler
+    match_pattern: "^Get-Service\\s+(-Name\\s+)?spooler"
+    output: |
+      Status   Name               DisplayName
+      ------   ----               -----------
+      Running  spooler            Print Spooler
+    reveals: null
+
+  # Common first instinct, and worth letting the operator try: the restart
+  # succeeds, but retained jobs survive it and the queue is still jammed.
+  - id: restart_spooler
+    match_pattern: "^Restart-Service\\s+(-Name\\s+)?spooler"
+    output: |
+      WARNING: Waiting for service 'Print Spooler (spooler)' to start...
+      (service restarted — jobs still present in queue)
+    reveals: "spooler_restart_attempted"
+
+optimal_path:
+  - ping_printer
+  - get_printer
+  - get_printjob
+  - remove_printjob
+  - get_printer
+
+resolution_paths:
+  - id: verified_fix
+    label: "Cleared the stuck job and verified the printer returned to Normal"
+    required_discoveries:
+      - stuck_job_found
+      - stuck_job_cleared
+      - fix_verified
+    score_modifier: 1.0
+
+  - id: unverified_fix
+    label: "Cleared the stuck job but did not verify the printer came back online"
+    required_discoveries:
+      - stuck_job_found
+      - stuck_job_cleared
+    score_modifier: 0.9
+
+  # Restarting the spooler without examining the queue — plausible instinct,
+  # but it doesn't resolve the issue and the diagnosis was never made.
+  - id: restart_only
+    label: "Restarted the spooler without identifying the stuck job — printer still offline"
+    required_discoveries:
+      - spooler_restart_attempted
+    score_modifier: 0.35
+
+  # This is squarely T1 work — escalation is a weak outcome even with diagnosis.
+  - id: diagnosed_escalated
+    label: "Identified the stuck job but escalated instead of clearing it"
+    required_discoveries:
+      - stuck_job_found
+    score_modifier: 0.6
+
+  - id: partial_diagnosis
+    label: "Confirmed the printer was offline but did not find the cause"
+    required_discoveries:
+      - printer_shows_offline
+    score_modifier: 0.4
+
+  - id: blind_escalation
+    label: "Escalated without running diagnostics"
+    required_discoveries: []
+    score_modifier: 0.15

@@ -1,0 +1,194 @@
+id: mapped_drive
+title: "Mapped Network Drive Unavailable"
+category: file_share
+system_template: windows_desktop
+shell: cmd
+description: >
+  Windows desktop user's Z: drive (the department file share) stopped working after
+  their machine installed updates and rebooted overnight. The file server itself is
+  healthy and reachable — the root cause is a stale persistent drive mapping whose
+  cached SMB session did not survive the reboot; Windows shows the drive as
+  Unavailable and Explorer throws "The network path was not found" when it is
+  opened. Correct T1 resolution is to confirm the mapping is stale with net use,
+  confirm the server is actually reachable (ping / nslookup), remove the dead
+  mapping, remap it to \\FS01\Projects, and verify the drive shows OK. This is a
+  classic T1 direct-fix; escalating it would be unnecessary.
+
+available_commands:
+  - "net use — list mapped drives and their status"
+  - "net use Z: /delete — remove the stale drive mapping"
+  - "net use Z: \\\\FS01\\Projects /persistent:yes — remap the drive"
+  - "dir Z: — list the contents of the mapped drive"
+  - "ping <server> — test whether the file server is reachable"
+  - "nslookup <server> — confirm the server name resolves"
+  - "ipconfig /all — view network adapter configuration"
+
+initial_ticket:
+  subject: "Z drive gone — can't get to my department files"
+  body: |
+    My Z drive is missing all my files. When I click on it I get an error about the
+    network path not found. Everything I'm working on this week is in there. It was
+    fine when I left yesterday — the only thing different is my computer restarted
+    itself overnight for updates. Did the update delete my files?? I really need
+    them back.
+
+system_state:
+  hostname: "WS-233"
+  username: "kpatel"
+  server_name: "FS01"
+  server_ip: "192.168.2.40"
+  share_path: "\\\\FS01\\Projects"
+
+commands:
+  # Specific forms of `net use` first — the bare listing pattern is anchored last.
+  - id: net_use_delete
+    match_pattern: "^net\\s+use\\s+z:\\s+/delete"
+    output: |
+      Z: was deleted successfully.
+    reveals: "stale_mapping_removed"
+
+  # Remapping only works once the stale mapping is gone — Windows refuses to
+  # reuse a drive letter that is still assigned (System error 85).
+  - id: net_use_map
+    match_pattern: "^net\\s+use\\s+z:\\s+\\\\\\\\fs01\\\\projects"
+    output: |
+      System error 85 has occurred.
+
+      The local device name is already in use.
+    reveals: null
+    conditional_outputs:
+      - requires: stale_mapping_removed
+        output: |
+          The command completed successfully.
+        reveals: "drive_remapped"
+
+  - id: net_use_list
+    match_pattern: "^net\\s+use\\s*$"
+    output: |
+      New connections will be remembered.
+
+      Status       Local     Remote                    Network
+      -------------------------------------------------------------------------------
+      Unavailable  Z:        {share_path}           Microsoft Windows Network
+      The command completed successfully.
+    reveals: "stale_mapping_visible"
+    conditional_outputs:
+      - requires: drive_remapped
+        output: |
+          New connections will be remembered.
+
+          Status       Local     Remote                    Network
+          -------------------------------------------------------------------------------
+          OK           Z:        {share_path}           Microsoft Windows Network
+          The command completed successfully.
+        reveals: "fix_verified"
+
+  # Opening the drive: fails while the stale mapping is in place, works after remap.
+  - id: dir_z
+    match_pattern: "^dir\\s+z:"
+    output: |
+      The network path was not found.
+    reveals: "drive_unreachable_confirmed"
+    conditional_outputs:
+      - requires: drive_remapped
+        # (|2 = explicit block indent — the first output line starts with a space)
+        output: |2
+           Volume in drive Z is Projects
+           Directory of Z:\
+
+          06/27/2026  04:12 PM    <DIR>          Budgets
+          06/28/2026  09:30 AM    <DIR>          Client_Deliverables
+          06/25/2026  11:02 AM    <DIR>          Templates
+                         0 File(s)              0 bytes
+                         3 Dir(s)  412,116,713,472 bytes free
+        reveals: "fix_verified"
+
+  # The server is fine — this rules out an outage and points back at the mapping.
+  - id: ping_server
+    match_pattern: "^ping\\s+\\S+"
+    output: |
+      Pinging {target} [{server_ip}] with 32 bytes of data:
+      Reply from {server_ip}: bytes=32 time=1ms TTL=128
+      Reply from {server_ip}: bytes=32 time<1ms TTL=128
+      Reply from {server_ip}: bytes=32 time<1ms TTL=128
+      Reply from {server_ip}: bytes=32 time=1ms TTL=128
+
+      Ping statistics for {server_ip}:
+          Packets: Sent = 4, Received = 4, Lost = 0 (0% loss)
+    reveals: "server_reachable"
+
+  - id: nslookup
+    match_pattern: "^nslookup\\s+\\S+"
+    output: |
+      Server:  dc01.corp.local
+      Address:  192.168.1.10
+
+      Name:    {server_name}.corp.local
+      Address:  {server_ip}
+    reveals: "server_resolves"
+
+  # Red herring: the workstation's own network config is completely normal.
+  - id: ipconfig
+    match_pattern: "^ipconfig\\b"
+    output: |
+      Windows IP Configuration
+
+         Host Name . . . . . . . . . . . . : {hostname}
+         Primary Dns Suffix  . . . . . . . : corp.local
+
+      Ethernet adapter Ethernet0:
+
+         Connection-specific DNS Suffix  . : corp.local
+         IPv4 Address. . . . . . . . . . . : 192.168.2.233
+         Subnet Mask . . . . . . . . . . . : 255.255.255.0
+         Default Gateway . . . . . . . . . : 192.168.2.1
+         DNS Servers . . . . . . . . . . . : 192.168.1.10
+    reveals: null
+
+optimal_path:
+  - net_use_list
+  - ping_server
+  - net_use_delete
+  - net_use_map
+  - net_use_list
+
+resolution_paths:
+  - id: verified_fix
+    label: "Remapped the drive and verified it shows OK / is browsable"
+    required_discoveries:
+      - stale_mapping_visible
+      - drive_remapped
+      - fix_verified
+    score_modifier: 1.0
+
+  - id: unverified_fix
+    label: "Remapped the drive but did not verify it afterward"
+    required_discoveries:
+      - stale_mapping_visible
+      - drive_remapped
+    score_modifier: 0.9
+
+  # Removed the mapping and stopped — the user is now worse off than before.
+  - id: deleted_without_remap
+    label: "Removed the stale mapping but never remapped the drive"
+    required_discoveries:
+      - stale_mapping_removed
+    score_modifier: 0.3
+
+  - id: diagnosed_escalated
+    label: "Identified the stale mapping but escalated instead of remapping it"
+    required_discoveries:
+      - stale_mapping_visible
+      - server_reachable
+    score_modifier: 0.6
+
+  - id: partial_diagnosis
+    label: "Confirmed the drive was unreachable but did not check the mapping or server"
+    required_discoveries:
+      - drive_unreachable_confirmed
+    score_modifier: 0.4
+
+  - id: blind_escalation
+    label: "Escalated without running diagnostics"
+    required_discoveries: []
+    score_modifier: 0.15

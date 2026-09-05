@@ -1,0 +1,147 @@
+id: account_lockout
+title: "User Account Locked Out"
+category: account
+system_template: linux_server
+shell: bash
+description: >
+  A user cannot log into a Linux server via SSH. Their account has been locked by
+  faillock after too many consecutive failed authentication attempts. The account
+  itself is valid, the password is correct and not expired, and the password is NOT
+  administratively locked (passwd --status shows P) — the faillock tally is the only
+  barrier. Correct T1 resolution is to confirm the lockout via faillock, reset it,
+  verify the tally is clear, and guide the user to log in (optionally suggesting a
+  password change). This is a direct-fix scenario — T1 techs have access to the
+  faillock tool.
+
+available_commands:
+  - "faillock --user <username> — show failed login attempts and lockout status"
+  - "faillock --user <username> --reset — clear the user's failed-attempt tally"
+  - "passwd --status <username> — show account password status (L=locked by admin, P=active)"
+  - "chage -l <username> — show password expiry and last change date"
+  - "getent passwd <username> — confirm the account exists in the system"
+  - "lastlog -u <username> — show the user's last successful login"
+
+initial_ticket:
+  subject: "Can't log in — keeps saying permission denied"
+  body: |
+    I've been trying to log into the dev server all morning and keep getting
+    "Permission denied" no matter what I do. I know my password is right —
+    I used it yesterday. This started after I got a new keyboard and must have
+    mistyped it a few times. Now it won't accept it at all. I have a deployment
+    to finish today. Can someone please help?
+
+system_state:
+  hostname: "dev-server-01"
+  username: "mjohnson"
+  lockout_count: "5"
+  last_login: "Thu Jun 26 09:14:22 2026"
+
+commands:
+  # faillock_reset must appear before faillock_check — both patterns start with
+  # "faillock --user <name>" and scenario.py returns on the first match.
+  - id: faillock_reset
+    match_pattern: "^faillock\\s+--user\\s+\\S+\\s+--reset"
+    output: |
+      (no output — faillock reset successful)
+    reveals: "lockout_reset"
+
+  # After the reset, re-running the check shows a clean tally — running it again
+  # to confirm is exactly the habit this scenario is trying to teach.
+  - id: faillock_check
+    match_pattern: "^faillock\\s+--user\\s+\\S+"
+    output: |
+      {username}:
+      When                Type  Source                                           Valid
+      2026-06-28 08:02:11 RHOST 192.168.1.105                                        V
+      2026-06-28 08:02:19 RHOST 192.168.1.105                                        V
+      2026-06-28 08:02:31 RHOST 192.168.1.105                                        V
+      2026-06-28 08:02:44 RHOST 192.168.1.105                                        V
+      2026-06-28 08:02:58 RHOST 192.168.1.105                                        V
+    reveals: "account_locked_by_faillock"
+    conditional_outputs:
+      - requires: lockout_reset
+        output: |
+          {username}:
+          When                Type  Source                                           Valid
+        reveals: "reset_verified"
+
+  # 'P' = password set and usable. A faillock lockout does NOT show here — this
+  # rules out an administrative `passwd -l` lock rather than confirming anything.
+  - id: passwd_status
+    match_pattern: "^passwd\\s+(--status|-S)\\s+\\S+"
+    output: |
+      {username} P 05/14/2026 0 99999 7 -1
+    reveals: "password_not_admin_locked"
+
+  - id: chage_check
+    match_pattern: "^chage\\s+-l\\s+\\S+"
+    output: |
+      Last password change                                : May 14, 2026
+      Password expires                                    : never
+      Password inactive                                   : never
+      Account expires                                     : never
+      Minimum number of days between password change      : 0
+      Maximum number of days between password change      : 99999
+      Number of days of warning before password expires   : 7
+    reveals: "password_not_expired"
+
+  - id: getent_passwd
+    match_pattern: "^getent\\s+passwd\\s+\\S+"
+    output: |
+      {username}:x:1002:1002:Marcus Johnson,,,:/home/{username}:/bin/bash
+    reveals: "account_exists"
+
+  - id: lastlog
+    match_pattern: "^lastlog\\s+-u\\s+\\S+"
+    output: |
+      Username         Port     From             Latest
+      {username}       pts/1    192.168.1.105    Thu Jun 26 09:14:22 +0000 2026
+    reveals: "last_login_visible"
+
+# Check the tally, reset it, then confirm the tally is actually clear before
+# telling the user they're good to go.
+optimal_path:
+  - faillock_check
+  - faillock_reset
+  - faillock_check
+
+resolution_paths:
+  - id: verified_fix
+    label: "Confirmed lockout, reset it, and verified the tally was clear before closing"
+    required_discoveries:
+      - account_locked_by_faillock
+      - lockout_reset
+      - reset_verified
+    score_modifier: 1.0
+
+  - id: direct_fix
+    label: "Confirmed account lockout and reset it — did not re-check before closing"
+    required_discoveries:
+      - account_locked_by_faillock
+      - lockout_reset
+    score_modifier: 0.9
+
+  - id: diagnosed_escalated
+    label: "Confirmed account lockout and escalated to sysadmin to reset"
+    required_discoveries:
+      - account_locked_by_faillock
+    score_modifier: 0.85
+
+  - id: partial_diagnosis
+    label: "Identified login failure but did not confirm the specific cause"
+    required_discoveries:
+      - account_exists
+    score_modifier: 0.4
+
+  # Ran the reset without ever looking at the tally first — the fix happened to
+  # work, but it was a guess, not a diagnosis.
+  - id: fix_without_diagnosis
+    label: "Reset the lockout without first confirming it was the cause"
+    required_discoveries:
+      - lockout_reset
+    score_modifier: 0.5
+
+  - id: blind_escalation
+    label: "Escalated without running diagnostics"
+    required_discoveries: []
+    score_modifier: 0.15

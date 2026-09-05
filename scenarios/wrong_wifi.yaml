@@ -1,0 +1,194 @@
+id: wrong_wifi
+title: "Mac on Wrong Wi-Fi — Internal Resources Unreachable"
+category: network
+system_template: mac_laptop
+shell: zsh
+description: >
+  MacBook user can browse the public internet but cannot reach anything internal —
+  the intranet, the file server, and the shared calendar all fail. Root cause: after
+  weekend maintenance on the office access points, the laptop auto-joined the open
+  "CorpGuest" network instead of the corporate "CorpWiFi" SSID. The guest VLAN
+  (172.16.20.0/24) has internet access but is isolated from internal resources and
+  uses public DNS that cannot resolve internal names. Correct T1 resolution is to
+  spot that the machine is on the guest SSID, confirm the guest-subnet address,
+  rejoin CorpWiFi with networksetup (or walk the user through the Wi-Fi menu), and
+  verify an internal host resolves and responds afterward. This is a T1 direct-fix
+  scenario; escalation is unnecessary.
+
+available_commands:
+  - "networksetup -getairportnetwork en0 — show which Wi-Fi network the Mac is joined to"
+  - "networksetup -setairportnetwork en0 <SSID> [password] — join a Wi-Fi network"
+  - "ifconfig en0 — view the Wi-Fi interface's IP address"
+  - "ping <host or IP> — test connectivity and name resolution"
+  - "scutil --dns — show the DNS servers the system is using"
+  - "traceroute <destination> — trace the network path to a destination"
+
+initial_ticket:
+  subject: "Internet works but nothing at work loads"
+  body: |
+    Something weird is going on with my MacBook since I got in this morning. Regular
+    websites load totally fine, but the intranet page won't open, I can't get to the
+    shared drive, and the office calendar won't sync. It's just me apparently — the
+    person next to me can open everything fine. I haven't changed anything. Wi-Fi
+    icon looks normal and says connected.
+
+system_state:
+  hostname: "MBP-lchen"
+  username: "lchen"
+  corp_ssid: "CorpWiFi"
+  guest_ssid: "CorpGuest"
+  guest_ip: "172.16.20.57"
+  corp_ip: "192.168.1.184"
+
+commands:
+  # Ordering: the set command (with an SSID argument) must precede the get command
+  # in case of loose typing, but their patterns are distinct anyway.
+  - id: set_airport_network
+    match_pattern: "^networksetup\\s+-setairportnetwork\\s+\\S+\\s+corpwifi"
+    output: |
+      (no output — joined {corp_ssid})
+    reveals: "rejoined_corp_wifi"
+
+  - id: get_airport_network
+    match_pattern: "^networksetup\\s+-getairportnetwork"
+    output: |
+      Current Wi-Fi Network: {guest_ssid}
+    reveals: "wrong_ssid_identified"
+    conditional_outputs:
+      - requires: rejoined_corp_wifi
+        output: |
+          Current Wi-Fi Network: {corp_ssid}
+        reveals: null
+
+  - id: ifconfig_en0
+    match_pattern: "^ifconfig(\\s+en0)?\\s*$"
+    output: |
+      en0: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500
+      	ether f4:d4:88:6a:2e:91
+      	inet {guest_ip} netmask 0xffffff00 broadcast 172.16.20.255
+      	media: autoselect
+      	status: active
+    reveals: "guest_subnet_ip_visible"
+    conditional_outputs:
+      - requires: rejoined_corp_wifi
+        output: |
+          en0: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500
+          	ether f4:d4:88:6a:2e:91
+          	inet {corp_ip} netmask 0xffffff00 broadcast 192.168.1.255
+          	media: autoselect
+          	status: active
+        reveals: null
+
+  # Internal names don't resolve from the guest VLAN; they do after rejoining.
+  - id: ping_internal
+    match_pattern: "^ping\\s+(?!\\d+\\.\\d+\\.\\d+\\.\\d+)\\S+"
+    output: |
+      ping: cannot resolve {target}: Unknown host
+    reveals: "internal_unreachable"
+    conditional_outputs:
+      - requires: rejoined_corp_wifi
+        output: |
+          PING {target} (192.168.1.20): 56 data bytes
+          64 bytes from 192.168.1.20: icmp_seq=0 ttl=63 time=2.104 ms
+          64 bytes from 192.168.1.20: icmp_seq=1 ttl=63 time=1.892 ms
+          ^C
+          --- {target} ping statistics ---
+          2 packets transmitted, 2 packets received, 0.0% packet loss
+        reveals: "fix_verified"
+
+  # Public internet works fine from the guest VLAN — this is what makes the
+  # "internet works but work stuff doesn't" symptom coherent.
+  - id: ping_ip
+    match_pattern: "^ping\\s+\\d+\\.\\d+\\.\\d+\\.\\d+"
+    output: |
+      PING {target} ({target}): 56 data bytes
+      64 bytes from {target}: icmp_seq=0 ttl=117 time=14.211 ms
+      64 bytes from {target}: icmp_seq=1 ttl=117 time=13.804 ms
+      ^C
+      --- {target} ping statistics ---
+      2 packets transmitted, 2 packets received, 0.0% packet loss
+    reveals: "internet_works"
+
+  # Supporting evidence: guest network hands out public DNS, so internal names
+  # can never resolve from here.
+  - id: scutil_dns
+    match_pattern: "^scutil\\s+--dns"
+    output: |
+      DNS configuration
+
+      resolver #1
+        nameserver[0] : 8.8.8.8
+        nameserver[1] : 8.8.4.4
+        if_index : 12 (en0)
+        flags    : Request A records
+    reveals: "public_dns_visible"
+    conditional_outputs:
+      - requires: rejoined_corp_wifi
+        output: |
+          DNS configuration
+
+          resolver #1
+            search domain[0] : corp.internal
+            nameserver[0] : 192.168.1.53
+            if_index : 12 (en0)
+            flags    : Request A records
+        reveals: null
+
+  # Red herring: the guest gateway routes to the internet fine — the path out
+  # is healthy, which is not where the problem is.
+  - id: traceroute
+    match_pattern: "^(traceroute|tracepath)\\s+"
+    output: |
+      traceroute to {target}, 64 hops max, 52 byte packets
+       1  172.16.20.1 (172.16.20.1)  1.512 ms  1.281 ms  1.190 ms
+       2  10.90.4.1 (10.90.4.1)  3.201 ms  2.876 ms  2.955 ms
+       3  * * *
+    reveals: null
+
+optimal_path:
+  - ping_internal
+  - ping_ip
+  - get_airport_network
+  - ifconfig_en0
+  - set_airport_network
+  - ping_internal
+
+resolution_paths:
+  - id: verified_fix
+    label: "Rejoined the corporate Wi-Fi and verified internal resources are reachable"
+    required_discoveries:
+      - wrong_ssid_identified
+      - rejoined_corp_wifi
+      - fix_verified
+    score_modifier: 1.0
+
+  - id: unverified_fix
+    label: "Rejoined the corporate Wi-Fi but did not verify internal access afterward"
+    required_discoveries:
+      - wrong_ssid_identified
+      - rejoined_corp_wifi
+    score_modifier: 0.9
+
+  # Fixed it without ever confirming which network the user was on.
+  - id: fix_without_diagnosis
+    label: "Switched networks without first confirming the wrong SSID was the cause"
+    required_discoveries:
+      - rejoined_corp_wifi
+    score_modifier: 0.5
+
+  - id: diagnosed_escalated
+    label: "Identified the wrong SSID but escalated instead of rejoining the network"
+    required_discoveries:
+      - wrong_ssid_identified
+    score_modifier: 0.6
+
+  - id: partial_diagnosis
+    label: "Confirmed internal resources were unreachable but did not find the cause"
+    required_discoveries:
+      - internal_unreachable
+    score_modifier: 0.4
+
+  - id: blind_escalation
+    label: "Escalated without running diagnostics"
+    required_discoveries: []
+    score_modifier: 0.15

@@ -1,0 +1,162 @@
+id: disk_full
+title: "Disk Full — Application Write Errors"
+category: storage
+system_template: linux_server
+description: >
+  A production application server is throwing "no space left on device" errors and
+  writing to the database has started failing. The root cause is /var/log filling up
+  due to verbose debug logging that was accidentally left enabled after a recent
+  testing period. The server's primary partition is at 100% usage. Correct T1
+  resolution is to diagnose which directory/files are consuming space, document
+  findings, and escalate to the sysadmin team — T1 should not delete files on a
+  production server without explicit authorization. Attempting to rm files directly
+  is poor practice and scores poorly even if it "would have worked."
+
+available_commands:
+  - "df -h — show disk usage by partition (human-readable sizes)"
+  - "du -sh <path> — show total size of a directory"
+  - "du -sh /var/log/* — show size of each item in /var/log"
+  - "ls -lh <path> — list directory contents with file sizes"
+  - "tail <file> — view the end of a log file"
+  - "journalctl -u <service> — view the service's recent log output"
+  - "top / free — check CPU and memory usage"
+  - "systemctl status <service> — check if the application service is still running"
+
+initial_ticket:
+  subject: "Application throwing errors, database writes failing"
+  body: |
+    Our customer portal has been throwing errors since about 6 AM. Users are getting
+    a generic "Something went wrong" message when they try to save anything. The
+    application team says the database is returning write errors but the database
+    server itself looks fine on their end. It's affecting all users. We have customers
+    waiting — please treat this as urgent.
+
+system_state:
+  hostname: "app-server-02"
+  username: "admin"
+  service_unit: "customer-portal.service"
+  app_log_path: "/var/log/customer-portal"
+  disk_partition: "/dev/sda1"
+
+commands:
+  - id: df_h
+    match_pattern: "^df\\s+(-h|-H)?\\s*$"
+    output: |
+      Filesystem      Size  Used Avail Use% Mounted on
+      udev            7.8G     0  7.8G   0% /dev
+      tmpfs           1.6G  1.1M  1.6G   1% /run
+      {disk_partition}   40G   40G     0 100% /
+      tmpfs           7.8G     0  7.8G   0% /dev/shm
+    reveals: "root_partition_full"
+
+  # Anchored so a more specific path (e.g. du -sh /var/log/customer-portal)
+  # falls through to the generic du_specific match below.
+  - id: du_var_log
+    match_pattern: "^du\\s+-sh\\s+/var/log/?\\*?\\s*$"
+    output: |
+      4.0K    /var/log/alternatives.log
+      8.0K    /var/log/apt
+      36G     /var/log/customer-portal
+      4.0K    /var/log/dpkg.log
+      12K     /var/log/syslog
+      244K    /var/log/journal
+    reveals: "app_log_dir_identified"
+
+  - id: du_specific
+    match_pattern: "^du\\s+-sh\\s+\\S+"
+    output: |
+      36G     {target}
+    reveals: "log_size_confirmed"
+
+  - id: ls_app_log
+    match_pattern: "^ls\\s+(-lh?\\s+)?/var/log/customer-portal"
+    output: |
+      total 36G
+      -rw-r--r-- 1 www-data www-data  12K Jun 01 00:00 app.log.2026-06-01
+      -rw-r--r-- 1 www-data www-data  11K Jun 02 00:00 app.log.2026-06-02
+      ...
+      -rw-r--r-- 1 www-data www-data 2.1G Jun 27 00:00 app.log.2026-06-27
+      -rw-r--r-- 1 www-data www-data 6.8G Jun 28 06:47 app.log.2026-06-28
+    reveals: "log_growth_pattern_visible"
+
+  - id: tail_log
+    match_pattern: "^tail\\s+\\S+"
+    output: |
+      [2026-06-28 06:47:33] DEBUG: Processing request id=9182736 user=cust_48291
+      [2026-06-28 06:47:33] DEBUG: SQL query: SELECT * FROM sessions WHERE user_id=48291
+      [2026-06-28 06:47:33] DEBUG: Query returned 1 row in 0.003ms
+      [2026-06-28 06:47:33] DEBUG: Rendering template: dashboard.html
+      [2026-06-28 06:47:33] DEBUG: Template rendered in 1.2ms
+      [2026-06-28 06:47:34] ERROR: IOError: [Errno 28] No space left on device
+    reveals: "debug_logging_enabled"
+
+  - id: systemctl_status
+    match_pattern: "^systemctl\\s+status\\s+\\S+"
+    output: |
+      ● {service_unit} - Customer Portal Application
+           Loaded: loaded (/etc/systemd/system/{service_unit}; enabled)
+           Active: active (running) since Fri 2026-06-28 05:58:02 UTC; 51min ago
+         Main PID: 12043 (gunicorn)
+
+      Jun 28 06:47:34 {hostname} gunicorn[12043]: IOError: [Errno 28] No space left on device
+      Jun 28 06:47:34 {hostname} gunicorn[12043]: Write to /var/log/customer-portal/app.log.2026-06-28 failed
+    reveals: "service_running_but_erroring"
+
+  # Supporting evidence: the service journal is full of the same write errors.
+  - id: journalctl
+    match_pattern: "^journalctl\\b"
+    output: |
+      Jun 28 06:47:31 {hostname} gunicorn[12043]: IOError: [Errno 28] No space left on device
+      Jun 28 06:47:32 {hostname} gunicorn[12043]: IOError: [Errno 28] No space left on device
+      Jun 28 06:47:33 {hostname} gunicorn[12043]: IOError: [Errno 28] No space left on device
+      Jun 28 06:47:34 {hostname} gunicorn[12043]: Write to /var/log/customer-portal/app.log.2026-06-28 failed
+    reveals: "write_errors_confirmed"
+
+  # Red herring: memory and CPU are healthy — the problem is disk, not resources.
+  # (|2 = explicit block indent, needed because the first output line starts with spaces)
+  - id: top_free
+    match_pattern: "^(top|free)\\s*(-h)?$"
+    output: |2
+                    total        used        free      shared  buff/cache   available
+      Mem:           15Gi       3.2Gi       8.1Gi       112Mi       4.4Gi        11Gi
+      Swap:         2.0Gi          0B       2.0Gi
+    reveals: null
+
+  # Attempting to delete log files directly — poor T1 practice on a production system.
+  - id: rm_logs
+    match_pattern: "^rm\\s+"
+    output: |
+      rm: cannot remove '/var/log/customer-portal/app.log.2026-06-28': Permission denied
+    reveals: "attempted_unauthorized_deletion"
+
+optimal_path:
+  - df_h
+  - du_var_log
+  - ls_app_log
+  - tail_log
+
+resolution_paths:
+  - id: correct_escalation
+    label: "Identified /var/log/customer-portal as root cause and escalated with evidence"
+    required_discoveries:
+      - root_partition_full
+      - app_log_dir_identified
+      - debug_logging_enabled
+    score_modifier: 1.0
+
+  - id: partial_escalation
+    label: "Confirmed disk full and escalated without tracing to the specific log directory"
+    required_discoveries:
+      - root_partition_full
+    score_modifier: 0.6
+
+  - id: unauthorized_deletion
+    label: "Attempted to delete production log files without authorization"
+    required_discoveries:
+      - attempted_unauthorized_deletion
+    score_modifier: 0.1
+
+  - id: blind_escalation
+    label: "Escalated without running any diagnostics"
+    required_discoveries: []
+    score_modifier: 0.15

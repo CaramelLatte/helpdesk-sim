@@ -1,0 +1,157 @@
+id: service_down
+title: "Web Application Service Down"
+category: service
+system_template: linux_server
+description: >
+  Linux server running a team dashboard web app. The app is unreachable because the
+  gunicorn service has crashed. Root cause is a missing Python config module (config.py)
+  in the application directory — a developer error, not an infrastructure failure.
+  The server itself is healthy and reachable. Correct T1 resolution is to diagnose the
+  service failure, identify the root cause from the logs, and escalate to the dev team
+  with that evidence. Attempting to restart the service without reading the logs is poor
+  practice and will not resolve the issue.
+
+available_commands:
+  - "ping <hostname or IP> — test server reachability"
+  - "curl <URL> — test HTTP connectivity to the application"
+  - "ss -tlnp / netstat -tlnp — list listening TCP ports"
+  - "systemctl status <service> — check whether the service is running and its last exit status"
+  - "journalctl -u <service> — view the service's recent log output"
+  - "ls /opt/dashboard — list the application directory contents"
+  - "systemctl restart <service> — attempt to restart the service"
+  - "top / free / df — check server resource usage (CPU, memory, disk)"
+
+initial_ticket:
+  subject: "Team dashboard is down — connection refused"
+  body: |
+    Our whole team is getting "connection refused" when trying to open the dashboard at
+    http://dashboard.internal. It was working fine yesterday afternoon. We have a sprint
+    standup in an hour and we use the dashboard to run it. Please help as soon as possible!
+
+system_state:
+  hostname: "app-server-01"
+  username: "admin"
+  service_unit: "gunicorn-dashboard.service"
+  server_ip: "192.168.1.200"
+  app_port: "8000"
+
+# NOTE on resolution design: the root cause here is a missing application config file —
+# a developer-level issue. The correct T1 resolution is diagnosis + escalation to the
+# dev team, NOT attempting a fix. This scenario is intentionally structured so that
+# correct escalation scores as the top resolution path, not "fix it yourself."
+commands:
+  - id: ping_server
+    match_pattern: "^ping\\s+\\S+"
+    output: |
+      PING {target} ({server_ip}) 56(84) bytes of data.
+      64 bytes from {server_ip}: icmp_seq=1 ttl=64 time=0.421 ms
+      64 bytes from {server_ip}: icmp_seq=2 ttl=64 time=0.389 ms
+      ^C
+      --- {target} ping statistics ---
+      2 packets transmitted, 2 received, 0% packet loss
+    reveals: "server_reachable"
+
+  - id: curl_app
+    match_pattern: "^curl\\s+\\S+"
+    output: |
+      curl: (7) Failed to connect to dashboard.internal port 80: Connection refused
+    reveals: "app_port_closed"
+
+  # Supporting evidence: nothing is listening on the app port — consistent with
+  # the connection-refused symptom and the crashed service.
+  - id: ss_netstat
+    match_pattern: "^(ss|netstat)\\b"
+    output: |
+      State    Recv-Q   Send-Q     Local Address:Port      Peer Address:Port   Process
+      LISTEN   0        128              0.0.0.0:22             0.0.0.0:*       users:(("sshd",pid=812,fd=3))
+      LISTEN   0        511            127.0.0.1:5432           0.0.0.0:*       users:(("postgres",pid=901,fd=6))
+    reveals: "app_port_not_listening"
+
+  - id: systemctl_status
+    match_pattern: "^systemctl\\s+status\\s+\\S+"
+    output: |
+      ● {service_unit} - Team Dashboard Application
+           Loaded: loaded (/etc/systemd/system/{service_unit}; enabled; vendor preset: enabled)
+           Active: failed (Result: exit-code) since Sat 2026-06-21 06:42:11 UTC; 2h 18min ago
+          Process: 8821 ExecStart=/usr/bin/gunicorn --workers 4 --bind 0.0.0.0:{app_port} app:app
+                   (code=exited, status=1/FAILURE)
+         Main PID: 8821 (code=exited, status=1/FAILURE)
+
+      Jun 21 06:42:11 {hostname} systemd[1]: {service_unit}: Main process exited, code=exited, status=1/FAILURE
+      Jun 21 06:42:11 {hostname} systemd[1]: Failed to start Team Dashboard Application.
+      Jun 21 06:42:11 {hostname} systemd[1]: {service_unit}: Unit entered failed state.
+    reveals: "service_failed"
+
+  - id: journalctl
+    match_pattern: "^journalctl\\s+"
+    output: |
+      Jun 21 06:42:11 {hostname} gunicorn[8821]: [ERROR] Error loading WSGI app. (multiple workers)
+      Jun 21 06:42:11 {hostname} gunicorn[8821]: Traceback (most recent call last):
+      Jun 21 06:42:11 {hostname} gunicorn[8821]:   File "/opt/dashboard/app.py", line 12, in <module>
+      Jun 21 06:42:11 {hostname} gunicorn[8821]:     from config import DATABASE_URL
+      Jun 21 06:42:11 {hostname} gunicorn[8821]: ModuleNotFoundError: No module named 'config'
+      Jun 21 06:42:11 {hostname} gunicorn[8821]: Worker failed to boot.
+    reveals: "config_module_missing"
+
+  - id: ls_app_dir
+    match_pattern: "^ls\\s+(-la?\\s+)?/opt/dashboard"
+    output: |
+      total 20
+      drwxr-xr-x 2 www-data www-data 4096 Jun 21 06:30 .
+      drwxr-xr-x 5 root     root     4096 Jun 20 14:00 ..
+      -rw-r--r-- 1 www-data www-data 4521 Jun 20 15:30 app.py
+      -rw-r--r-- 1 www-data www-data  892 Jun 20 15:30 requirements.txt
+      -rw-r--r-- 1 www-data www-data  234 Jun 20 15:30 wsgi.py
+    reveals: "config_file_absent"   # config.py is notably missing from the listing
+
+  # Attempting a restart after seeing the service failed — reasonable T1 instinct,
+  # but it won't work because the underlying code problem is still there.
+  - id: systemctl_restart
+    match_pattern: "^systemctl\\s+restart\\s+\\S+"
+    output: |
+      Job for {service_unit} failed because the control process exited with error code.
+      See "journalctl -xe" for details.
+    reveals: "restart_fails"
+
+  # Red herring: server resources look fine — not the cause.
+  - id: top_free
+    match_pattern: "^(top|free|df)\\s*(-h)?$"
+    output: |
+      Filesystem      Size  Used Avail Use% Mounted on
+      /dev/sda1        40G   12G   26G  32% /
+      tmpfs           7.8G  1.1G  6.7G  14% /dev/shm
+      (server resources are healthy)
+    reveals: null
+
+optimal_path:
+  - ping_server
+  - curl_app
+  - systemctl_status
+  - journalctl
+
+resolution_paths:
+  # Correct T1 resolution: diagnose, document findings, escalate to dev team.
+  - id: correct_escalation
+    label: "Identified missing config module and escalated to development team with log evidence"
+    required_discoveries:
+      - config_module_missing
+    score_modifier: 1.0
+
+  - id: escalation_with_service_info
+    label: "Escalated with service failure details but without identifying root cause"
+    required_discoveries:
+      - service_failed
+    score_modifier: 0.65
+
+  - id: blind_escalation
+    label: "Escalated without running diagnostics"
+    required_discoveries: []
+    score_modifier: 0.2
+
+  # Attempting to fix it yourself (restarting without reading the logs) is poor practice
+  # for a T1 tech when the root cause is a code issue.
+  - id: restart_without_diagnosis
+    label: "Attempted service restart without diagnosing root cause — service still down"
+    required_discoveries:
+      - restart_fails
+    score_modifier: 0.3
