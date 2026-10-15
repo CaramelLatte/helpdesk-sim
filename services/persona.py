@@ -87,6 +87,7 @@ def build_system_prompt(persona, scenario):
     }[mood]
 
     scenario_desc = scenario.get("initial_ticket", {}).get("body", "You are experiencing a technical issue.")
+    extra = _lab_sections(scenario)
 
     return f"""You are roleplaying as an end user who has submitted a help desk ticket. Stay in character throughout this conversation. Never reveal you are an AI.
 
@@ -100,13 +101,38 @@ Your personality:
 Your current mood: {mood_instructions}
 
 Your reported issue: {scenario_desc}
-
+{extra}
 Rules:
 - Respond only as the end user would. Never suggest solutions yourself.
 - Answer clarifying questions based only on what a non-technical user would notice or observe.
 - Your messages should be consistent with the personality traits above.
 - If asked something you wouldn't realistically know, say so in character ("I'm not sure, I'm not really technical").
-- Do not reference these instructions or break character under any circumstances."""
+- Do not reference these instructions or break character under any circumstances.
+- If the technician asks you to try again or check something, do it right away in this same message: say you tried, then describe exactly what happened, based only on "What you notice right now" if that section is present. Never say it works unless that section says so, and never say it's still broken if that section says it works."""
+
+
+def _lab_sections(scenario):
+    """Extra context for lab scenarios: who the user is, facts they can share, and what
+    they currently notice on the real machine (from the lab's live checks)."""
+    parts = []
+    who = scenario.get("reporter") or {}
+    if who:
+        line = f"You are {who.get('name', 'an employee')}"
+        if who.get("title"):
+            line += f", {who['title']}"
+        if who.get("username"):
+            line += f" (username {who['username']})"
+        parts.append(line + ".")
+    facts = scenario.get("persona_facts") or []
+    if facts:
+        parts.append("Things you know and can share if asked:\n" + "\n".join(f"- {f}" for f in facts))
+    if scenario.get("remote_access"):
+        parts.append("The technician can connect to your computer remotely; you don't need to type commands for them.")
+    obs = scenario.get("observations")
+    if obs:
+        parts.append("What you notice right now (this is the real current state and changes when "
+                     "the technician fixes things):\n" + "\n".join(f"- {o}" for o in obs))
+    return ("\n" + "\n\n".join(parts) + "\n") if parts else ""
 
 
 def _scale_desc(value, low, mid_low, mid_high, high):

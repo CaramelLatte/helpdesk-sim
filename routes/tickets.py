@@ -6,6 +6,9 @@ import services.persona as persona_svc
 import services.scenario as scenario_svc
 import services.scheduler as scheduler
 import services.llm as llm
+import services.lab as lab
+import services.catalog as catalog
+import routes.lab_tickets as lab_tickets
 
 tickets_bp = Blueprint("tickets", __name__)
 
@@ -23,9 +26,11 @@ def create_ticket():
         return jsonify({"error": "scenario_id is required"}), 400
 
     try:
-        scenario = scenario_svc.load_scenario(scenario_id)
+        kind, short_id, scenario = catalog.resolve(scenario_id, catalog.lab_allowed(request))
     except FileNotFoundError as e:
         return jsonify({"error": str(e)}), 404
+    if kind == "lab":
+        return lab_tickets.create_lab_ticket(short_id, scenario)
 
     # Roll a fresh persona and build the opening message.
     traits = persona_svc.roll_persona()
@@ -187,7 +192,11 @@ def close_ticket(ticket_id):
         return jsonify({"error": f"Ticket is already {ticket['status']}"}), 400
 
     data = request.get_json() or {}
-    resolution_notes = data.get("resolution_notes", "")
+    # The web UI sends "notes"; the CLI client sends "resolution_notes".
+    resolution_notes = data.get("resolution_notes") or data.get("notes") or ""
+
+    if ticket.get("lab_session_id"):
+        return lab_tickets.close_lab_ticket(ticket, resolution_notes)
 
     # Read actual Zammad ticket state — don't push anything.
     z_ticket = zammad.get_ticket(ticket["zammad_ticket_id"])
@@ -231,8 +240,14 @@ def list_tickets():
 
 @tickets_bp.route("/api/scenarios", methods=["GET"])
 def list_scenarios():
-    """Lists available scenario IDs."""
-    return jsonify({"scenarios": scenario_svc.list_scenarios()})
+    """Lists available scenario IDs (lab scenarios first when the lab is offered)."""
+    return jsonify({"scenarios": catalog.scenario_ids(catalog.lab_allowed(request))})
+
+
+@tickets_bp.route("/api/catalog", methods=["GET"])
+def scenario_catalog():
+    """Scenario list with titles, difficulty and which consoles each one offers."""
+    return jsonify({"scenarios": catalog.entries(catalog.lab_allowed(request))})
     
 
 @tickets_bp.route("/api/admin/cleanup", methods=["POST"])

@@ -148,6 +148,31 @@ You'll be prompted for brief resolution notes. The grading model runs and your p
 
 ---
 
+## Live machines (IT lab)
+
+Scenarios marked as lab scenarios run on a real, disposable Linux machine instead
+of the scripted shell. The lab (`lab` container, repo `it-lab`) clones a frozen
+template, injects the scenario's fault, and gives the operator a real terminal and,
+for desktop scenarios, the user's screen. It records everything done on the machine
+and measures the machine's state before and after.
+
+- `GET /api/catalog` lists scenarios with title, difficulty, `kind` (`lab` or `sim`)
+  and consoles. `GET /api/scenarios` still returns plain ids.
+- `POST /api/tickets` for a lab scenario also returns `lab.consoles` (terminal and
+  desktop page URLs with a per-session token; only the creator gets them).
+- The shell endpoints keep working for lab tickets: commands run on the real machine.
+- The persona sees what the user would currently notice on the machine (from the
+  lab's live checks), so "can you try again?" gets an honest answer.
+- At close, the lab's evidence report (ground truth, end state, every action, file
+  changes, transcript, deterministic outcome) goes into the grading prompt with the
+  conversation and timing. Lab grading adds a **Change safety** dimension.
+- Lab scenarios with a `legacy_id` replace the scripted scenario they supersede
+  (`LAB_REPLACES_SIM`). Windows/macOS scenarios stay on the scripted shell.
+
+Settings in `.env`: `LAB_URL`, `LAB_API_KEY`, `LAB_PUBLIC` (offer lab scenarios to
+public visitors; requests made directly to the app inside its container can always
+use them), `LAB_PUBLIC_PREFIX` (browser path to the lab consoles, default `/api/lab`).
+
 ## Grading dimensions
 
 | Dimension | What it measures |
@@ -297,6 +322,8 @@ The persona, LLM calls, and scheduler are entirely backend — the UI never inte
 ---
 
 ## Roadmap
+
+- **More lab tracks** — the lab is app-agnostic (tracks, templates, faults); Tier 2 sysadmin and networking apps can reuse it
 
 - **Public-facing web UI** — planned for integration with personal site (see UI integration section above for the API surface it will use)
 - **Named personas** — pre-defined characters (e.g., an impatient executive, an HR coordinator onboarding a new hire) with fixed identities in Zammad, for a more narrative demo experience

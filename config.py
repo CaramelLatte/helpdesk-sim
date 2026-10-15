@@ -23,3 +23,15 @@ FLASK_HOST = os.getenv('FLASK_HOST', '127.0.0.1')
 # Graded/closed tickets older than this many hours are automatically deleted.
 # Set to 0 to disable auto-cleanup.
 CLEANUP_AFTER_HOURS = int(os.getenv('CLEANUP_AFTER_HOURS', '24'))
+
+# IT lab (real machines with injected faults). Empty LAB_URL turns it off and
+# every scenario uses the scripted shell.
+LAB_URL = os.getenv('LAB_URL', '')
+LAB_API_KEY = os.getenv('LAB_API_KEY', '')
+LAB_TRACK = os.getenv('LAB_TRACK', 'helpdesk')
+# Path prefix the browser uses for lab consoles (the edge proxies it to labd's /console/)
+LAB_PUBLIC_PREFIX = os.getenv('LAB_PUBLIC_PREFIX', '/api/lab')
+# When true, lab scenarios replace the scripted Linux scenarios they supersede (legacy_id)
+LAB_REPLACES_SIM = os.getenv('LAB_REPLACES_SIM', 'true').lower() == 'true'
+# Separate switch for listing lab scenarios on the public site (root shells for visitors)
+LAB_PUBLIC = os.getenv('LAB_PUBLIC', 'false').lower() == 'true'

@@ -73,18 +73,33 @@ def init_db():
         )
     """)
 
+    # Lab-backed tickets: the lab session that holds the real machine for this ticket.
+    columns = [r[1] for r in c.execute("PRAGMA table_info(tickets)").fetchall()]
+    if "lab_session_id" not in columns:
+        c.execute("ALTER TABLE tickets ADD COLUMN lab_session_id TEXT")
+
+    # The lab's evidence report, kept with the ticket (the lab prunes its own copies).
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS lab_reports (
+            ticket_id INTEGER PRIMARY KEY REFERENCES tickets(id),
+            outcome TEXT,
+            report_json TEXT,
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        )
+    """)
+
     conn.commit()
     conn.close()
 
 
 # --- Ticket helpers ---
 
-def create_ticket(zammad_ticket_id, scenario_id):
+def create_ticket(zammad_ticket_id, scenario_id, lab_session_id=None):
     conn = get_conn()
     c = conn.cursor()
     c.execute(
-        "INSERT INTO tickets (zammad_ticket_id, scenario_id) VALUES (?, ?)",
-        (zammad_ticket_id, scenario_id)
+        "INSERT INTO tickets (zammad_ticket_id, scenario_id, lab_session_id) VALUES (?, ?, ?)",
+        (zammad_ticket_id, scenario_id, lab_session_id)
     )
     ticket_id = c.lastrowid
     conn.commit()
@@ -234,8 +249,31 @@ def get_tickets_older_than(hours, statuses=("graded", "closed")):
 def delete_ticket_cascade(ticket_id):
     """Removes a ticket and all related rows. Call after deleting from Zammad."""
     conn = get_conn()
-    for table in ("grading_results", "command_log", "personas"):
+    for table in ("grading_results", "command_log", "personas", "lab_reports"):
         conn.execute(f"DELETE FROM {table} WHERE ticket_id = ?", (ticket_id,))
     conn.execute("DELETE FROM tickets WHERE id = ?", (ticket_id,))
     conn.commit()
     conn.close()
+
+
+# --- Lab report helpers ---
+
+def save_lab_report(ticket_id, outcome, report):
+    conn = get_conn()
+    conn.execute(
+        "INSERT OR REPLACE INTO lab_reports (ticket_id, outcome, report_json) VALUES (?, ?, ?)",
+        (ticket_id, outcome, json.dumps(report))
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_lab_report(ticket_id):
+    conn = get_conn()
+    row = conn.execute("SELECT * FROM lab_reports WHERE ticket_id = ?", (ticket_id,)).fetchone()
+    conn.close()
+    if not row:
+        return None
+    d = dict(row)
+    d["report"] = json.loads(d.pop("report_json") or "{}")
+    return d

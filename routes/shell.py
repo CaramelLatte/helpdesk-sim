@@ -1,6 +1,8 @@
 from flask import Blueprint, request, jsonify
 import db
 import services.scenario as scenario_svc
+import services.lab as lab
+from routes.lab_tickets import lab_commands_help
 
 shell_bp = Blueprint("shell", __name__)
 
@@ -22,6 +24,17 @@ def run_command(ticket_id):
     command = (data.get("command") or "").strip()
     if not command:
         return jsonify({"error": "command is required"}), 400
+
+    # Lab tickets run the command on the real machine. The lab records it as evidence;
+    # it's also logged here so the shell panel's history works the same way.
+    if ticket.get("lab_session_id"):
+        try:
+            res = lab.run_command(ticket["lab_session_id"], command)
+        except lab.LabUnavailable as e:
+            return jsonify({"error": f"The lab machine is not available: {e}"}), 409
+        db.log_command(ticket_id, command, res["output"], [])
+        return jsonify({"command": command, "output": res["output"], "matched": True,
+                        "reveals": None, "exit_code": res["rc"]})
 
     # Discoveries made so far feed conditional outputs — e.g. a verification
     # command shows the fixed state only after the fix command has been run.
@@ -47,6 +60,10 @@ def get_available_commands(ticket_id):
     ticket = db.get_ticket(ticket_id)
     if not ticket:
         return jsonify({"error": "Ticket not found"}), 404
+
+    if ticket.get("lab_session_id"):
+        return jsonify({"scenario_id": ticket["scenario_id"], "shell": "bash", "lab": True,
+                        "available_commands": lab_commands_help(ticket)})
 
     try:
         scenario = scenario_svc.load_scenario(ticket["scenario_id"])

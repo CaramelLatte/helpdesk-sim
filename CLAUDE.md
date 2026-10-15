@@ -87,10 +87,22 @@ Rubric inputs: communication quality/tone across the thread, technical accuracy,
 Escalation handling must be scored as described above: appropriate escalation = valid resolution, not a fallback or partial failure.
 
 
+Phase 2: live machines (implemented 2026-10)
+
+The deferred "live system images" item now exists as a separate service, the IT lab (repo it-lab, `lab` container). It doesn't change the decisions above, it extends them:
+
+- Determinism: every session starts from the same frozen template snapshot with the same scripted fault, so the starting state is identical for everyone. What the machine returns is real, not templated.
+- Clean grading: the lab measures ground truth instead of inferring it (checks before/after, every command, file diffs) and returns a deterministic outcome from the scenario's outcome table, the same role resolution paths play for scripted scenarios. The grading model is told it's authoritative.
+- Correct escalation can still reach full credit (outcome tables are authored that way).
+- Model split unchanged: persona model for the user, grading model for the review. The lab uses no LLM at runtime.
+- Scripted scenarios stay for Windows/macOS, where there's no lab template yet.
+
+Code: services/lab.py (client), services/catalog.py (lab vs scripted routing), routes/lab_tickets.py (create/close/grade for lab tickets).
+
 Explicit non-goals / deferred (do not build into v1)
 
 
-Docker-based live system images for remote-access-style tickets (Phase 2 stretch goal — would cut into the model pool available for narrative/persona, and needs lead time to load)
+Docker-based live system images for remote-access-style tickets (Phase 2 — now built as the IT lab, see above)
 LLM-generated scenarios at runtime (authoring-time LLM assistance only, per above)
 PSA feature parity in the ticketing layer
 More than 2 system templates or more than 2 scenario categories at launch

@@ -15,8 +15,9 @@ from apscheduler.schedulers.background import BackgroundScheduler
 import db
 import services.zammad as zammad
 import services.persona as persona_svc
-import services.scenario as scenario_svc
+import services.catalog as catalog
 import services.llm as llm
+import services.lab as lab
 from config import SCHEDULER_INTERVAL_SECONDS, CLEANUP_AFTER_HOURS
 
 # Populated on startup with the Zammad user ID of our api account,
@@ -100,7 +101,7 @@ def _process_ticket(ticket):
 def _reply_to_operator(ticket, persona, public_articles):
     """Generates and posts a persona response to a new operator message."""
     ticket_id = ticket["id"]
-    scenario = scenario_svc.load_scenario(ticket["scenario_id"])
+    scenario = catalog.persona_scenario(ticket)
     system_prompt = persona_svc.build_system_prompt(persona, scenario)
 
     history = _build_history(public_articles)
@@ -126,7 +127,7 @@ def _maybe_follow_up(ticket, persona, public_articles):
     db.update_persona(ticket_id, current_mood=new_mood, follow_up_count=persona["follow_up_count"] + 1)
 
     updated_persona = db.get_persona(ticket_id)
-    scenario = scenario_svc.load_scenario(ticket["scenario_id"])
+    scenario = catalog.persona_scenario(ticket)
     system_prompt = persona_svc.build_system_prompt(updated_persona, scenario)
 
     history = _build_history(public_articles)
@@ -166,6 +167,8 @@ def _cleanup_old_tickets(app):
                 zammad.delete_ticket(ticket["zammad_ticket_id"])
             except Exception as e:
                 print(f"[cleanup] Zammad delete failed for ticket {ticket['id']}: {e}")
+            if ticket.get("lab_session_id"):
+                lab.destroy(ticket["lab_session_id"])   # normally gone already; harmless if so
             db.delete_ticket_cascade(ticket["id"])
             print(f"[cleanup] Removed ticket {ticket['id']} (Zammad #{ticket['zammad_ticket_id']})")
 
