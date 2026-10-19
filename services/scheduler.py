@@ -156,7 +156,7 @@ def _build_history(public_articles):
 
 
 def _cleanup_old_tickets(app):
-    """Deletes graded/closed tickets older than CLEANUP_AFTER_HOURS from Zammad and SQLite."""
+    """Deletes all tickets older than CLEANUP_AFTER_HOURS, abandoned open ones included, from Zammad and SQLite."""
     with app.app_context():
         tickets = db.get_tickets_older_than(CLEANUP_AFTER_HOURS)
         if not tickets:
@@ -168,7 +168,7 @@ def _cleanup_old_tickets(app):
             except Exception as e:
                 print(f"[cleanup] Zammad delete failed for ticket {ticket['id']}: {e}")
             if ticket.get("lab_session_id"):
-                lab.destroy(ticket["lab_session_id"])   # normally gone already; harmless if so
+                lab.destroy(ticket["lab_session_id"])   # gone already unless the ticket was abandoned; harmless if so
             db.delete_ticket_cascade(ticket["id"])
             print(f"[cleanup] Removed ticket {ticket['id']} (Zammad #{ticket['zammad_ticket_id']})")
 

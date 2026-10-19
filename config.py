@@ -20,7 +20,7 @@ SCHEDULER_INTERVAL_SECONDS = int(os.getenv('SCHEDULER_INTERVAL_SECONDS', '60'))
 FLASK_PORT = int(os.getenv('FLASK_PORT', '5001'))
 FLASK_HOST = os.getenv('FLASK_HOST', '127.0.0.1')
 
-# Graded/closed tickets older than this many hours are automatically deleted.
+# Tickets older than this many hours are automatically deleted, open ones included.
 # Set to 0 to disable auto-cleanup.
 CLEANUP_AFTER_HOURS = int(os.getenv('CLEANUP_AFTER_HOURS', '24'))
 

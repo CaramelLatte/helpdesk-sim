@@ -253,7 +253,7 @@ def scenario_catalog():
 @tickets_bp.route("/api/admin/cleanup", methods=["POST"])
 def manual_cleanup():
     """
-    Immediately deletes all graded/closed tickets older than CLEANUP_AFTER_HOURS
+    Immediately deletes all tickets (any status) older than CLEANUP_AFTER_HOURS
     from both Zammad and the local database. Useful before a demo.
     """
     from flask import current_app

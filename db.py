@@ -232,15 +232,13 @@ def get_grading_result(ticket_id):
     return d
 
 
-def get_tickets_older_than(hours, statuses=("graded", "closed")):
-    """Returns tickets with a given status whose created_at is older than N hours."""
-    placeholders = ",".join("?" for _ in statuses)
+def get_tickets_older_than(hours):
+    """Returns every ticket, whatever its status, whose created_at is older than N hours."""
     conn = get_conn()
     rows = conn.execute(
-        f"""SELECT * FROM tickets
-            WHERE status IN ({placeholders})
-            AND datetime(created_at) < datetime('now', ? || ' hours')""",
-        (*statuses, f"-{hours}")
+        """SELECT * FROM tickets
+           WHERE datetime(created_at) < datetime('now', ? || ' hours')""",
+        (f"-{hours}",)
     ).fetchall()
     conn.close()
     return [dict(r) for r in rows]

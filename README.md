@@ -244,7 +244,7 @@ This enables the verify-your-fix pattern: gate a `fix_verified` discovery behind
 
 ## Ticket cleanup
 
-Graded tickets older than `CLEANUP_AFTER_HOURS` are automatically deleted from both Zammad and the local database. The cleanup job runs every 6 hours.
+Tickets older than `CLEANUP_AFTER_HOURS` are automatically deleted from both Zammad and the local database, whatever their status: abandoned open tickets go too, along with any lab machine they still hold. The cleanup job runs every 6 hours.
 
 To trigger cleanup manually (useful before a demo):
 ```bash
@@ -252,8 +252,6 @@ curl -s -X POST http://localhost:5001/api/admin/cleanup
 ```
 
 To disable auto-cleanup, set `CLEANUP_AFTER_HOURS=0` in `.env`.
-
-Open (in-progress) tickets are never auto-deleted.
 
 ---
 
