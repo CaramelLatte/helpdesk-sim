@@ -1,5 +1,7 @@
 id: printer_offline
 title: "Printer Shows Offline — Jobs Stuck in Queue"
+# Shown on the public scenario card. Keep it to the symptom: no cause, no fix.
+summary: "The office printer shows offline and nothing will print. Terminal access to the user's machine."
 category: printing
 system_template: windows_desktop
 shell: powershell

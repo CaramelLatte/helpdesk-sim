@@ -1,5 +1,7 @@
 id: account_lockout
 title: "User Account Locked Out"
+# Shown on the public scenario card. Keep it to the symptom: no cause, no fix.
+summary: "A user can't sign in and keeps getting \"permission denied\". Terminal access to their machine."
 category: account
 system_template: linux_server
 shell: bash

@@ -1,5 +1,7 @@
 id: mapped_drive
 title: "Mapped Network Drive Unavailable"
+# Shown on the public scenario card. Keep it to the symptom: no cause, no fix.
+summary: "A user's Z: drive has disappeared and they can't reach their department files. Terminal access to their machine."
 category: file_share
 system_template: windows_desktop
 shell: cmd

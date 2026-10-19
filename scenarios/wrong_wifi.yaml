@@ -1,5 +1,7 @@
 id: wrong_wifi
 title: "Mac on Wrong Wi-Fi — Internal Resources Unreachable"
+# Shown on the public scenario card. Keep it to the symptom: no cause, no fix.
+summary: "A user's internet works but nothing at work loads. Terminal access to their Mac."
 category: network
 system_template: mac_laptop
 shell: zsh

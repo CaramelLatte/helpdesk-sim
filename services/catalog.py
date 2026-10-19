@@ -50,7 +50,7 @@ def entries(include_lab):
             y = sim.load_scenario(sid)
         except Exception:
             continue
-        out.append({"id": sid, "title": y.get("title", sid), "description": y.get("description", "").strip(),
+        out.append({"id": sid, "title": y.get("title", sid), "description": y.get("summary", ""),
                     "difficulty": y.get("difficulty"), "tier": 1, "kind": "sim",
                     "consoles": ["shell"], "system": y.get("system_template")})
     return out

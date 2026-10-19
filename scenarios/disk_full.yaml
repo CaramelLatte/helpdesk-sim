@@ -1,5 +1,7 @@
 id: disk_full
 title: "Disk Full — Application Write Errors"
+# Shown on the public scenario card. Keep it to the symptom: no cause, no fix.
+summary: "The customer portal is throwing errors and saves are failing for every user. Terminal access to the app server."
 category: storage
 system_template: linux_server
 description: >

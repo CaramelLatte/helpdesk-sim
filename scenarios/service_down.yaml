@@ -1,5 +1,7 @@
 id: service_down
 title: "Web Application Service Down"
+# Shown on the public scenario card. Keep it to the symptom: no cause, no fix.
+summary: "The team dashboard is refusing connections. Terminal access to the server."
 category: service
 system_template: linux_server
 description: >

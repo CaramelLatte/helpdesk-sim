@@ -1,5 +1,7 @@
 id: dns_failure
 title: "DNS Resolution Failure"
+# Shown on the public scenario card. Keep it to the symptom: no cause, no fix.
+summary: "A user can't reach the company wiki and some websites. Terminal access to their workstation."
 category: dns
 system_template: linux_desktop
 shell: bash
