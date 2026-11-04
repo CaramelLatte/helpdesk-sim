@@ -3,7 +3,7 @@ LM Studio client. LM Studio exposes an OpenAI-compatible API, so we use the open
 package pointed at localhost instead of Anthropic's servers.
 """
 from openai import OpenAI
-from config import LM_STUDIO_URL, PERSONA_MODEL, GRADING_MODEL
+from config import LM_STUDIO_URL, PERSONA_MODEL, GRADING_MODEL, LLM_DISABLE_THINKING
 
 # The api_key value doesn't matter for LM Studio — it just needs to be a non-empty string.
 _client = OpenAI(base_url=LM_STUDIO_URL, api_key="lm-studio")
@@ -15,8 +15,12 @@ def _chat(model, messages, temperature=0.7, max_tokens=512):
         messages=messages,
         temperature=temperature,
         max_tokens=max_tokens,
+        extra_body={"chat_template_kwargs": {"enable_thinking": False}} if LLM_DISABLE_THINKING else None,
     )
-    return response.choices[0].message.content.strip()
+    content = (response.choices[0].message.content or "").strip()
+    if not content:
+        raise RuntimeError(f"{model} returned no text (finish_reason={response.choices[0].finish_reason})")
+    return content
 
 
 def generate_persona_message(system_prompt, conversation_history):

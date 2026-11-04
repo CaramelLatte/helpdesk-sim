@@ -10,6 +10,9 @@ OPERATOR_API_KEY = os.getenv('OPERATOR_API_KEY')
 LM_STUDIO_URL = f"http://{os.getenv('LM_STUDIO_ADDRESS', 'localhost')}:{os.getenv('LM_STUDIO_PORT', '1234')}/v1"
 PERSONA_MODEL = os.getenv('TICKET_GEN_MODEL', 'local-model')
 GRADING_MODEL = os.getenv('GRADING_MODEL', 'local-model')
+# Reasoning models (e.g. Qwen3.x) otherwise spend the token budget thinking and return no text.
+# Sends chat_template_kwargs.enable_thinking=false (llama.cpp / Lemonade / vLLM).
+LLM_DISABLE_THINKING = os.getenv('LLM_DISABLE_THINKING', 'false').lower() == 'true'
 
 DB_PATH = os.getenv('DB_PATH', 'ai_ticket.db')
 SCENARIOS_DIR = os.getenv('SCENARIOS_DIR', 'scenarios')
