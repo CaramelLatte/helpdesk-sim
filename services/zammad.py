@@ -69,7 +69,11 @@ def add_article(zammad_ticket_id, body, internal=False, sender=None):
         "type": "note",
         "sender": sender,
     }
-    r = requests.post(_url("ticket_articles"), headers=_headers(), json=payload)
+    # Tickets are filed with the API user as the customer, and Zammad turns anything a
+    # ticket's customer posts into a public Customer article. Internal notes and Agent
+    # articles therefore have to come from the operator (agent) account.
+    headers = _operator_headers() if (internal or sender == "Agent") and OPERATOR_API_KEY else _headers()
+    r = requests.post(_url("ticket_articles"), headers=headers, json=payload)
     r.raise_for_status()
     return r.json()
 
@@ -103,9 +107,17 @@ def set_ticket_resolution(zammad_ticket_id, state=None, group=None):
         payload["state"] = state
     if group:
         payload["group"] = group
-    r = requests.put(_url(f"tickets/{zammad_ticket_id}"), headers=_headers(), json=payload)
+    # As the ticket's customer the API user may close it but not reassign it (Zammad
+    # silently ignores the group), so this is an agent action: use the operator token.
+    headers = _operator_headers() if OPERATOR_API_KEY else _headers()
+    r = requests.put(_url(f"tickets/{zammad_ticket_id}"), headers=headers, json=payload)
     r.raise_for_status()
-    return r.json()
+    updated = r.json()
+    if group and get_group_name(updated.get("group_id")) != group:
+        raise RuntimeError(f"Zammad did not move ticket {zammad_ticket_id} to group {group!r}")
+    if state and get_ticket_state_name(updated.get("state_id")) != state:
+        raise RuntimeError(f"Zammad did not set ticket {zammad_ticket_id} to state {state!r}")
+    return updated
 
 
 def get_ticket_articles(zammad_ticket_id):

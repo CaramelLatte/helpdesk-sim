@@ -99,7 +99,7 @@ def run_command(scenario_id, command_text, discoveries=None):
     }
 
 
-def get_resolution_path(scenario_id, discoveries):
+def get_resolution_path(scenario_id, discoveries, escalated=None):
     """
     Given a set of discovery IDs accumulated during the session, finds the best
     matching resolution path and returns its id, label, and score_modifier.
@@ -119,7 +119,14 @@ def get_resolution_path(scenario_id, discoveries):
 
     # If somehow nothing matched (shouldn't happen given blind_escalation has no requirements),
     # fall back to a zero-score default.
-    return best or {"id": "unknown", "label": "No resolution path matched", "score_modifier": 0.0}
+    if best is None:
+        return {"id": "unknown", "label": "No resolution path matched", "score_modifier": 0.0}
+    # blind_escalation is also the catch-all for "no diagnosis at all". When the operator
+    # closed the ticket instead of escalating, say so (same credit).
+    if best["id"] == "blind_escalation" and escalated is False:
+        best = dict(best, id="closed_without_diagnosis",
+                    label="Closed the ticket without diagnosing or fixing the issue")
+    return best
 
 
 def _format_output(template, scenario, command_text):

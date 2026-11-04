@@ -209,7 +209,9 @@ def close_ticket(ticket_id):
     # Determine which resolution path was taken based on shell discoveries.
     discoveries = db.get_all_discoveries(ticket_id)
     scenario = scenario_svc.load_scenario(ticket["scenario_id"])
-    resolution = scenario_svc.get_resolution_path(ticket["scenario_id"], discoveries)
+    escalated = group_name != "Users" or state_name != "closed"
+    resolution = scenario_svc.get_resolution_path(ticket["scenario_id"], discoveries,
+                                                  escalated=escalated)
 
     # Post the full shell command log as a single internal note so the Zammad
     # ticket record has the diagnostic trail attached without cluttering the live thread.
@@ -366,6 +368,11 @@ GRADING GUIDANCE:
     * Direct fix: confirm with the user in plain, non-technical language that the issue is resolved and briefly what was done.
     * Escalation: inform the user the ticket is being passed to the appropriate team, what they can expect next, and a rough timeline. Do NOT suggest relaying raw technical findings (nameserver values, log excerpts) to the end user — those go to the receiving team, not the customer.
 - If the user declined remote access or preferred to be guided through steps verbally, do not penalize reduced shell activity. Verbal guidance is a valid T1 resolution.
+- CROSS-CHECK THE NOTES: resolution notes are the ticket's permanent record and must be true. Check every claim in OPERATOR NOTES AT CLOSE against the thread and COMMANDS RUN:
+    * A claim about what the user said, reported, confirmed or agreed to must appear in a user message in the thread. Permission to make a change is NOT confirmation that the fix worked.
+    * A claim that something was checked, changed, fixed or verified must appear in COMMANDS RUN (or, for verbal guidance, in the thread).
+    * If any claim is unsupported, quote it in FEEDBACK. An invented user confirmation caps CUSTOMER_SERVICE at 4; invented technical work caps DIAGNOSTIC_ACCURACY at 3. Lower OVERALL to match.
+- A direct fix the user was never told about is an unclosed loop: CUSTOMER_SERVICE at most 7.
 - Be specific in feedback. Reference actual messages or commands. Vague praise or criticism is not useful to the trainee.
 
 Please evaluate on these dimensions and give a score from 0–10 for each:
@@ -384,6 +391,8 @@ ESCALATION_JUDGMENT: <score>/10
 RESPONSE_TIMELINESS: <score>/10
 CUSTOMER_SERVICE: <score>/10
 OVERALL: <score>/100
+NOTES_INVENTED_USER_CONFIRMATION: <yes|no>
+NOTES_INVENTED_TECHNICAL_WORK: <yes|no>
 FEEDBACK: <your feedback>"""
 
     system_prompt = ("You are an experienced IT help desk trainer. "
@@ -408,10 +417,16 @@ FEEDBACK: <your feedback>"""
                 rubric["customer_service"] = line.split(":")[1].strip()
             elif line.startswith("OVERALL:"):
                 rubric["overall_score"] = line.split(":")[1].strip()
+            elif line.startswith("NOTES_INVENTED_USER_CONFIRMATION:"):
+                rubric["notes_invented_user_confirmation"] = line.split(":")[1].strip().lower().startswith("y")
+            elif line.startswith("NOTES_INVENTED_TECHNICAL_WORK:"):
+                rubric["notes_invented_technical_work"] = line.split(":")[1].strip().lower().startswith("y")
             elif line.startswith("FEEDBACK:"):
                 rubric["feedback"] = line.split(":", 1)[1].strip()
     except Exception:
         pass
+
+    _enforce_caps(rubric, resolution, zammad_state, zammad_group, articles, command_log)
 
     overall = float(rubric.get("overall_score", "0").split("/")[0]) if "overall_score" in rubric else 0.0
 
@@ -425,6 +440,73 @@ FEEDBACK: <your feedback>"""
 
     return rubric
 
+
+
+def _parse_ts(ts):
+    if not ts:
+        return None
+    dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    # SQLite timestamps have no timezone — treat them as UTC to match Zammad's aware datetimes.
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def _score(value):
+    try:
+        return int(float(str(value).split("/")[0]))
+    except (TypeError, ValueError):
+        return None
+
+
+def _cap(rubric, key, limit, reason, notes):
+    current = _score(rubric.get(key))
+    if current is None or current <= limit:
+        return 0
+    rubric[key] = f"{limit}/10"
+    notes.append(f"{key.replace('_', ' ').capitalize()} capped at {limit}/10: {reason}.")
+    return current - limit
+
+
+def _enforce_caps(rubric, resolution, zammad_state, zammad_group, articles, command_log):
+    """
+    The model reliably notices these problems but doesn't hold to numeric caps, so the
+    caps are applied here. Each rubric point removed costs 2 overall points (five items
+    make up 100). Adjustments are listed in rubric["adjustments"] and in the feedback.
+    """
+    notes = []
+    removed = 0
+    if rubric.get("notes_invented_user_confirmation"):
+        removed += _cap(rubric, "customer_service", 4,
+                        "the notes claim the user confirmed something the thread doesn't show", notes)
+    if rubric.get("notes_invented_technical_work"):
+        removed += _cap(rubric, "diagnostic_accuracy", 3,
+                        "the notes claim checks or fixes that the command log doesn't show", notes)
+
+    # Direct fix the user was never told about: no operator message after the last command
+    # that revealed something (the fix or its verification). Later idle commands don't count.
+    direct_fix = (zammad_state == "closed" and zammad_group == "Users"
+                  and resolution.get("score_modifier", 0) >= 0.9)
+    revealing = [e for e in command_log if e.get("revealed")]
+    if direct_fix and revealing:
+        ai_user_id = scheduler.get_ai_user_id()
+        last_cmd = _parse_ts(revealing[-1].get("executed_at"))
+        told = any(
+            a.get("created_by_id") != ai_user_id and not a.get("internal", False)
+            and (_parse_ts(a.get("created_at")) or last_cmd) > last_cmd
+            for a in articles
+        )
+        if not told:
+            removed += _cap(rubric, "customer_service", 7,
+                            "the user was never told the issue was fixed", notes)
+
+    if not notes:
+        return
+    overall = _score(rubric.get("overall_score"))
+    if overall is not None:
+        rubric["overall_score"] = f"{max(0, overall - 2 * removed)}/100"
+    rubric["adjustments"] = notes
+    rubric["feedback"] = (rubric.get("feedback", "") + " " + " ".join(notes)).strip()
 
 def _format_conversation(articles):
     """
