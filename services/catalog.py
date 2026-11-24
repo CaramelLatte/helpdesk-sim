@@ -9,6 +9,7 @@ or on the scripted shell, and that builds the persona's view of the scenario.
   - LAB_PUBLIC controls whether lab scenarios are offered to public visitors. Requests
     made directly to gunicorn inside the container can always use them, for testing.
 """
+import re
 import services.lab as lab
 import services.scenario as sim
 from config import LAB_REPLACES_SIM, LAB_PUBLIC
@@ -95,3 +96,26 @@ def persona_scenario(ticket):
         "observations": observations,
         "remote_access": sorted(s.get("access", {})),
     }
+
+
+def briefing(kind, scenario):
+    """
+    What practice mode shows instead of the conversation: the ticket as filed plus the facts
+    the simulated user would give if asked. Built only from fields both modes already need
+    (scripted: initial_ticket + hostname/username; lab: ticket.*), so any scenario that works
+    with the persona also works in practice mode. Lab ticket text is written to the persona
+    ("You use SSH to app01..."), hence `voice` so the UI can label it.
+    """
+    if kind == "lab":
+        t = scenario.get("ticket", {})
+        return {"subject": t.get("subject", scenario["title"]), "body": (t.get("body") or "").strip(),
+                "reporter": t.get("reporter") or {}, "facts": t.get("persona_facts", []), "voice": "user_brief"}
+    state = scenario.get("system_state", {})
+    reporter = {k: state[k] for k in ("username", "hostname") if state.get(k)}
+    if state.get("full_name"):
+        reporter["name"] = state["full_name"]
+    t = scenario.get("initial_ticket", {})
+    # YAML `|` blocks keep the author's hard line breaks; join them, keep blank-line paragraphs.
+    body = re.sub(r"(?<!\n)\n(?!\n)", " ", (t.get("body") or "").strip())
+    return {"subject": t.get("subject", scenario.get("title", "")), "body": body,
+            "reporter": reporter, "facts": [], "voice": "ticket"}

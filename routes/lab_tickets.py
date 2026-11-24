@@ -15,6 +15,10 @@ state and grade. The differences:
     terminal transcript) and a deterministic outcome. The grading model gets that
     report plus the ticket conversation and timing, and is told the outcome is
     authoritative, exactly like resolution paths in the scripted flow.
+
+Practice mode (ticket mode "practice") keeps the machine and drops the ticket side: no
+persona, no Zammad ticket. Close returns the programmatic check (services/checks.py) and
+grading runs only if the operator asks for it (POST /api/tickets/<id>/grade).
 """
 import re
 from flask import jsonify
@@ -23,7 +27,12 @@ import services.zammad as zammad
 import services.persona as persona_svc
 import services.llm as llm
 import services.lab as lab
+import services.catalog as catalog
+import services.checks as checks
 from config import ZAMMAD_URL, GRADING_MODEL
+
+# Rubric items that only make sense with a conversation; dropped when grading practice attempts.
+CONVERSATION_DIMENSIONS = {"response_timeliness", "customer_service"}
 
 DEFAULT_RUBRIC = [
     {"id": "diagnostic_accuracy", "label": "Diagnostic accuracy"},
@@ -35,12 +44,38 @@ DEFAULT_RUBRIC = [
 ]
 
 
-def create_lab_ticket(short_id, scenario):
-    traits = persona_svc.roll_persona()
+def _lab_info(sess, status):
+    return {
+        "session_id": sess["session"],
+        "consoles": lab.console_urls(sess["session"], sess["token"], status.get("access", {})),
+        "access": status.get("access", {}),
+        "machines": [{"hostname": m["hostname"], "role": m["role"]} for m in status.get("machines", [])],
+    }
+
+
+def create_lab_ticket(short_id, scenario, practice=False):
     try:
         sess = lab.start_session(short_id, ref="helpdesk-sim")
     except lab.LabUnavailable as e:
         return jsonify({"error": str(e)}), 503
+
+    if practice:
+        try:
+            status = lab.wait_ready(sess["session"])
+        except Exception as e:
+            lab.destroy(sess["session"])
+            msg = str(e) if isinstance(e, lab.LabUnavailable) else "Could not start the session."
+            return jsonify({"error": msg}), 503
+        ticket_id = db.create_ticket(0, short_id, lab_session_id=sess["session"], mode="practice")
+        return jsonify({
+            "ticket_id": ticket_id,
+            "mode": "practice",
+            "scenario": short_id,
+            "brief": catalog.briefing("lab", scenario),
+            "lab": _lab_info(sess, status),
+        }), 201
+
+    traits = persona_svc.roll_persona()
 
     t = scenario.get("ticket", {})
     persona_view = {
@@ -75,12 +110,8 @@ def create_lab_ticket(short_id, scenario):
         "scenario": short_id,
         "persona_traits": traits,
         "zammad_url": f"{ZAMMAD_URL}/#ticket/zoom/{z_ticket['id']}",
-        "lab": {
-            "session_id": sess["session"],
-            "consoles": lab.console_urls(sess["session"], sess["token"], status.get("access", {})),
-            "access": status.get("access", {}),
-            "machines": [{"hostname": m["hostname"], "role": m["role"]} for m in status.get("machines", [])],
-        },
+        "mode": "full",
+        "lab": _lab_info(sess, status),
     }), 201
 
 
@@ -100,11 +131,10 @@ def lab_commands_help(ticket):
     ]
 
 
-def close_lab_ticket(ticket, resolution_notes):
-    z_ticket = zammad.get_ticket(ticket["zammad_ticket_id"])
-    state_name = zammad.get_ticket_state_name(z_ticket["state_id"])
-    group_name = zammad.get_group_name(z_ticket["group_id"])
-    articles = zammad.get_ticket_articles(ticket["zammad_ticket_id"])
+def close_lab_ticket(ticket, resolution_notes, state_name, group_name):
+    """state_name/group_name: the resolution the operator chose (Zammad, or the local row in practice)."""
+    practice = ticket.get("mode") == "practice"
+    articles = [] if practice else zammad.get_ticket_articles(ticket["zammad_ticket_id"])
 
     # The lab's outcome table speaks in terms of what the operator did with the ticket.
     if state_name == "closed":
@@ -123,25 +153,47 @@ def close_lab_ticket(ticket, resolution_notes):
             return jsonify({"error": f"Could not collect the lab evidence: {e}"}), 503
 
     db.save_lab_report(ticket["id"], report["outcome"]["id"], report)
+    if practice:
+        db.update_ticket(ticket["id"], status="closed", closed_at=_sqlite_now())
+        return jsonify(lab_result(db.get_ticket(ticket["id"]), report, state_name, group_name, None))
+
     _post_lab_note(ticket, report)
     result = _grade(ticket, report, resolution_notes, state_name, group_name, articles)
-    db.update_ticket(ticket["id"], status="graded")
+    db.update_ticket(ticket["id"], status="graded", closed_at=_sqlite_now())
+    return jsonify(lab_result(db.get_ticket(ticket["id"]), report, state_name, group_name, result))
 
+
+def grade_practice(ticket):
+    """Grading on request for a closed practice attempt, from the report saved at close."""
+    saved = db.get_lab_report(ticket["id"])
+    if not saved:
+        return jsonify({"error": "No lab report was saved for this attempt"}), 409
+    report = saved["report"]
+    state, group = ticket.get("resolution_state") or "open", ticket.get("resolution_group") or "Users"
+    result = _grade(ticket, report, ticket.get("resolution_notes") or "", state, group, [], practice=True)
+    db.update_ticket(ticket["id"], status="graded")
+    return jsonify(lab_result(ticket, report, state, group, result))
+
+
+def lab_result(ticket, report, state_name, group_name, grading):
+    """Response for close and grade. `grading` is None for a practice close."""
     outcome = report["outcome"]
-    return jsonify({
+    return {
+        "mode": ticket.get("mode", "full"),
         "zammad_state": state_name,
         "zammad_group": group_name,
         "resolution_path": {"id": outcome["id"], "label": outcome["label"],
                             "score_modifier": outcome["score"]},
-        "grading": result,
-        "lab": {
-            "outcome": outcome,
-            "facts": {k: report["facts"][k] for k in ("fixed", "symptoms_fixed", "collateral", "verified")},
-            "checks": [{"desc": c["desc"], "kind": c["kind"], "before": c["baseline"], "after": c["final"]}
-                       for c in report["checks"] if c["kind"] != "info"],
-            "debrief": report.get("debrief", ""),
-        },
-    })
+        "check": checks.lab_check(ticket, report),
+        "grading": grading,
+        "lab": {"outcome": outcome, "debrief": report.get("debrief", "")},
+    }
+
+
+def _sqlite_now():
+    """Same format as SQLite's datetime('now'), which created_at uses (UTC, no zone)."""
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
 
 def _post_lab_note(ticket, report):
@@ -159,12 +211,15 @@ def _post_lab_note(ticket, report):
         print(f"[lab] could not post evidence note: {e}")
 
 
-def _grade(ticket, report, resolution_notes, zammad_state, zammad_group, articles):
-    """Builds the lab grading prompt, calls the grading model, parses and saves the result."""
+def _grade(ticket, report, resolution_notes, zammad_state, zammad_group, articles, practice=False):
+    """Builds the lab grading prompt, calls the grading model, parses and saves the result.
+    practice=True: no conversation existed, so conversation dimensions and guidance are left out."""
     from routes.tickets import _compute_timing, _format_conversation   # shared with the scripted flow
 
     persona = db.get_persona(ticket["id"])
     rubric = (lab.track() or {}).get("rubric") or DEFAULT_RUBRIC
+    if practice:
+        rubric = [d for d in rubric if d["id"] not in CONVERSATION_DIMENSIONS]
     timing = _compute_timing(ticket, articles)
     literacy = persona["technical_literacy"] if persona else 5.0
     if literacy < 3:
@@ -188,24 +243,45 @@ def _grade(ticket, report, resolution_notes, zammad_state, zammad_group, article
     fmt = "\n".join(f"{d['id'].upper()}: <score>/10" for d in rubric)
     modifier = report["outcome"]["score"]
 
-    grading_prompt = f"""You are evaluating an IT help desk training exercise worked on a REAL machine.
-
-The trainee talked to a simulated end user through a ticket and worked on a real (disposable) Linux
-machine through a terminal{' and the user’s remote desktop' if 'gui' in report.get('access', {}) else ''}.
-A fault was injected on purpose. The lab measured the machine before and after and recorded every
-action. Treat the lab report's END STATE, FACTS and DETERMINISTIC OUTCOME as authoritative: they are
-measurements, not opinions. Your job is to judge how well the work was done, not to re-decide the outcome.
-
-{report.get('text', '')}
-
-=== TICKET SIDE (helpdesk system) ===
+    desktop = ' and the user’s remote desktop' if 'gui' in report.get('access', {}) else ''
+    if practice:
+        intro = (f"The trainee worked on a real (disposable) Linux machine through a terminal{desktop} in PRACTICE MODE:\n"
+                 "there was no simulated end user and no ticket conversation, only a written brief. This mode is for\n"
+                 "practising the technical work.")
+        ticket_side = f"""=== TICKET SIDE ===
+PRACTICE MODE: no conversation took place. Do not score or comment on customer service, communication or timeliness.
+Steps that need the user (verifying their identity, asking them to test, telling them it's fixed) were impossible:
+do not lower any score for their absence. You may mention them in one short sentence as a reminder for the full simulation.
+RESOLUTION CHOSEN: {zammad_context}
+OPERATOR NOTES AT CLOSE: {resolution_notes or '(none provided)'}"""
+        cs_guidance = ""
+    else:
+        intro = ("The trainee talked to a simulated end user through a ticket and worked on a real (disposable) Linux\n"
+                 f"machine through a terminal{desktop}.")
+        ticket_side = f"""=== TICKET SIDE (helpdesk system) ===
 ZAMMAD WORKFLOW CONTEXT: {zammad_context}
 TIMING: time to first response {timing['ttfr']}; total session {timing['session_time']};
         unprompted follow-ups from the user: {persona['follow_up_count'] if persona else 'unknown'}
 OPERATOR NOTES AT CLOSE: {resolution_notes or '(none provided)'}
 
 CONVERSATION THREAD (user = simulated end user, operator = trainee):
-{_format_conversation(articles)}
+{_format_conversation(articles)}"""
+        cs_guidance = f"""- RESPONSE TIMELINESS: from the timing metrics and follow-up count.
+- CUSTOMER SERVICE: the user's technical literacy was {literacy_desc}; judge language against that. Identity verification
+  matters before account changes. Closing the loop: for a fix, confirm in plain language it works (ideally ask the user to
+  check); for an escalation, say who has it now and what happens next, without dumping raw technical findings on the user.
+"""
+
+    grading_prompt = f"""You are evaluating an IT help desk training exercise worked on a REAL machine.
+
+{intro}
+A fault was injected on purpose. The lab measured the machine before and after and recorded every
+action. Treat the lab report's END STATE, FACTS and DETERMINISTIC OUTCOME as authoritative: they are
+measurements, not opinions. Your job is to judge how well the work was done, not to re-decide the outcome.
+
+{report.get('text', '')}
+
+{ticket_side}
 
 GRADING GUIDANCE:
 - DIAGNOSTIC ACCURACY: did they find the actual root cause from the ground truth, or correctly recognise it was beyond T1?
@@ -218,11 +294,7 @@ GRADING GUIDANCE:
 - CHANGE SAFETY: use the guard checks, FILE CHANGES and anti-patterns. Reward minimal, targeted changes and verifying the
   fix; penalise collateral damage, unnecessary changes (e.g. resetting a working password), weakening security, editing
   production code/config, or deleting data.
-- RESPONSE TIMELINESS: from the timing metrics and follow-up count.
-- CUSTOMER SERVICE: the user's technical literacy was {literacy_desc}; judge language against that. Identity verification
-  matters before account changes. Closing the loop: for a fix, confirm in plain language it works (ideally ask the user to
-  check); for an escalation, say who has it now and what happens next, without dumping raw technical findings on the user.
-- CROSS-CHECK CLAIMS: if the operator told the user (or wrote in notes) that something was checked, changed or fixed,
+{cs_guidance}- CROSS-CHECK CLAIMS: if the operator told the user (or wrote in notes) that something was checked, changed or fixed,
   confirm it against the actions and end state. Unsupported claims are a serious problem; say so specifically.
 - The OVERALL score should be consistent with the outcome's score modifier ({modifier}): it should rarely exceed
   {int(modifier * 100) + 5}.

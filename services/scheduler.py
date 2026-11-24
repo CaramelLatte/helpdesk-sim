@@ -46,6 +46,8 @@ def _check_tickets(app):
     """Runs inside the scheduler's background thread."""
     with app.app_context():
         for ticket in db.get_open_tickets():
+            if ticket.get("mode") == "practice":
+                continue   # no persona and no Zammad ticket to watch
             try:
                 _process_ticket(ticket)
             except Exception as e:
@@ -147,10 +149,11 @@ def _cleanup_old_tickets(app):
             return
         print(f"[cleanup] Found {len(tickets)} ticket(s) to remove.")
         for ticket in tickets:
-            try:
-                zammad.delete_ticket(ticket["zammad_ticket_id"])
-            except Exception as e:
-                print(f"[cleanup] Zammad delete failed for ticket {ticket['id']}: {e}")
+            if ticket.get("mode") != "practice":   # practice tickets never had a Zammad ticket
+                try:
+                    zammad.delete_ticket(ticket["zammad_ticket_id"])
+                except Exception as e:
+                    print(f"[cleanup] Zammad delete failed for ticket {ticket['id']}: {e}")
             if ticket.get("lab_session_id"):
                 lab.destroy(ticket["lab_session_id"])   # gone already unless the ticket was abandoned; harmless if so
             db.delete_ticket_cascade(ticket["id"])

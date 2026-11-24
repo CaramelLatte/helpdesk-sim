@@ -22,7 +22,7 @@ def init_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             zammad_ticket_id INTEGER NOT NULL,
             scenario_id TEXT NOT NULL,
-            status TEXT NOT NULL DEFAULT 'open',   -- open | closed | graded
+            status TEXT NOT NULL DEFAULT 'open',   -- open | closed (practice, checked) | graded
             -- When Option B (named personas) is added, populate this with a Zammad customer user ID.
             zammad_customer_id INTEGER,
             last_operator_article_id INTEGER,       -- highest Zammad article ID seen from operator
@@ -78,6 +78,16 @@ def init_db():
     if "lab_session_id" not in columns:
         c.execute("ALTER TABLE tickets ADD COLUMN lab_session_id TEXT")
 
+    # Practice mode: no Zammad ticket (zammad_ticket_id is 0), no persona. The resolution the
+    # operator chose and their notes are kept here instead, so grading can be asked for later.
+    for col, ddl in (("mode", "TEXT NOT NULL DEFAULT 'full'"),   # full | practice
+                     ("resolution_state", "TEXT"),
+                     ("resolution_group", "TEXT"),
+                     ("resolution_notes", "TEXT"),
+                     ("closed_at", "TEXT")):
+        if col not in columns:
+            c.execute(f"ALTER TABLE tickets ADD COLUMN {col} {ddl}")
+
     # The lab's evidence report, kept with the ticket (the lab prunes its own copies).
     c.execute("""
         CREATE TABLE IF NOT EXISTS lab_reports (
@@ -94,12 +104,13 @@ def init_db():
 
 # --- Ticket helpers ---
 
-def create_ticket(zammad_ticket_id, scenario_id, lab_session_id=None):
+def create_ticket(zammad_ticket_id, scenario_id, lab_session_id=None, mode="full"):
+    """Practice tickets have no Zammad ticket: pass zammad_ticket_id=0 (never a real Zammad id)."""
     conn = get_conn()
     c = conn.cursor()
     c.execute(
-        "INSERT INTO tickets (zammad_ticket_id, scenario_id, lab_session_id) VALUES (?, ?, ?)",
-        (zammad_ticket_id, scenario_id, lab_session_id)
+        "INSERT INTO tickets (zammad_ticket_id, scenario_id, lab_session_id, mode) VALUES (?, ?, ?, ?)",
+        (zammad_ticket_id, scenario_id, lab_session_id, mode)
     )
     ticket_id = c.lastrowid
     conn.commit()

@@ -38,3 +38,8 @@ LAB_PUBLIC_PREFIX = os.getenv('LAB_PUBLIC_PREFIX', '/api/lab')
 LAB_REPLACES_SIM = os.getenv('LAB_REPLACES_SIM', 'true').lower() == 'true'
 # Separate switch for listing lab scenarios on the public site (root shells for visitors)
 LAB_PUBLIC = os.getenv('LAB_PUBLIC', 'false').lower() == 'true'
+
+# Programmatic pass/fail at close: a resolution path (scripted) or lab outcome passes when its
+# score is at least this. 0.9 is where the grading prompt already treats judgment as correct;
+# every scenario's intended resolutions score 0.9 or more.
+PASS_SCORE = float(os.getenv('PASS_SCORE', '0.9'))

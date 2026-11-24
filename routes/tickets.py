@@ -8,6 +8,7 @@ import services.scheduler as scheduler
 import services.llm as llm
 import services.lab as lab
 import services.catalog as catalog
+import services.checks as checks
 import routes.lab_tickets as lab_tickets
 
 tickets_bp = Blueprint("tickets", __name__)
@@ -17,20 +18,35 @@ tickets_bp = Blueprint("tickets", __name__)
 def create_ticket():
     """
     Starts a new training session.
-    Body (JSON): { "scenario_id": "dns_failure" }
-    Returns the local ticket ID and the Zammad ticket ID.
+    Body (JSON): { "scenario_id": "dns_failure", "mode": "full" }
+      mode "full" (default): persona + Zammad ticket + grading at close.
+      mode "practice": no persona, no Zammad ticket, no model calls. Returns a written brief;
+        close returns the programmatic check, and grading is optional (POST .../grade).
+    Returns the local ticket ID (and the Zammad ticket ID in full mode).
     """
-    data = request.get_json()
+    data = request.get_json() or {}
     scenario_id = data.get("scenario_id")
     if not scenario_id:
         return jsonify({"error": "scenario_id is required"}), 400
+    mode = data.get("mode", "full")
+    if mode not in ("full", "practice"):
+        return jsonify({"error": "mode must be 'full' or 'practice'"}), 400
 
     try:
         kind, short_id, scenario = catalog.resolve(scenario_id, catalog.lab_allowed(request))
     except FileNotFoundError as e:
         return jsonify({"error": str(e)}), 404
     if kind == "lab":
-        return lab_tickets.create_lab_ticket(short_id, scenario)
+        return lab_tickets.create_lab_ticket(short_id, scenario, practice=(mode == "practice"))
+
+    if mode == "practice":
+        ticket_id = db.create_ticket(0, scenario_id, mode="practice")   # 0 = no Zammad ticket
+        return jsonify({
+            "ticket_id": ticket_id,
+            "mode": "practice",
+            "scenario": scenario_id,
+            "brief": catalog.briefing("sim", scenario),
+        }), 201
 
     # Roll a fresh persona and build the opening message.
     traits = persona_svc.roll_persona()
@@ -66,6 +82,7 @@ def create_ticket():
         "scenario": scenario_id,
         "persona_traits": traits,
         "zammad_url": f"{__import__('config').ZAMMAD_URL}/#ticket/zoom/{z_id}",
+        "mode": "full",
     }), 201
 
 
@@ -97,6 +114,8 @@ def get_thread(ticket_id):
     ticket = db.get_ticket(ticket_id)
     if not ticket:
         return jsonify({"error": "Ticket not found"}), 404
+    if ticket["mode"] == "practice":
+        return jsonify({"error": "Practice tickets have no conversation"}), 409
 
     articles = zammad.get_ticket_articles(ticket["zammad_ticket_id"])
     public = [a for a in articles if not a.get("internal", False)]
@@ -129,6 +148,8 @@ def post_reply(ticket_id):
         return jsonify({"error": "Ticket not found"}), 404
     if ticket["status"] != "open":
         return jsonify({"error": "Ticket is not open"}), 400
+    if ticket["mode"] == "practice":
+        return jsonify({"error": "Practice tickets have no conversation"}), 409
 
     data = request.get_json()
     message = (data.get("message") or "").strip()
@@ -168,7 +189,12 @@ def set_state(ticket_id):
     if not state and not group:
         return jsonify({"error": "Provide at least one of: state, group"}), 400
 
-    zammad.set_ticket_resolution(ticket["zammad_ticket_id"], state=state, group=group)
+    if ticket["mode"] == "practice":
+        # No Zammad ticket: keep the choice on the local row, with Zammad's defaults
+        # (new tickets are state open, group Users) for whatever isn't given.
+        db.update_ticket(ticket_id, resolution_state=state or "open", resolution_group=group or "Users")
+    else:
+        zammad.set_ticket_resolution(ticket["zammad_ticket_id"], state=state, group=group)
 
     return jsonify({
         "zammad_ticket_id": ticket["zammad_ticket_id"],
@@ -180,10 +206,13 @@ def set_state(ticket_id):
 @tickets_bp.route("/api/tickets/<int:ticket_id>/close", methods=["POST"])
 def close_ticket(ticket_id):
     """
-    Triggers grading for a training session the operator has finished working.
+    Ends a training session the operator has finished working.
     Does NOT push any state to Zammad — the operator is expected to have already
-    closed or reassigned the ticket in the Zammad UI before calling this.
+    closed or reassigned the ticket (Zammad UI or PATCH .../state) before calling this.
     Body (JSON, optional): { "resolution_notes": "Diagnosed bad DNS, escalated to network team." }
+
+    Full mode: returns the programmatic check and the grading model's review.
+    Practice mode: returns only the check; POST .../grade asks for the review afterwards.
     """
     ticket = db.get_ticket(ticket_id)
     if not ticket:
@@ -195,23 +224,23 @@ def close_ticket(ticket_id):
     # The web UI sends "notes"; the CLI client sends "resolution_notes".
     resolution_notes = data.get("resolution_notes") or data.get("notes") or ""
 
-    if ticket.get("lab_session_id"):
-        return lab_tickets.close_lab_ticket(ticket, resolution_notes)
+    practice = ticket["mode"] == "practice"
+    if practice:
+        db.update_ticket(ticket_id, resolution_notes=resolution_notes)
+    state_name, group_name = _resolution_choice(ticket)
 
-    # Read actual Zammad ticket state — don't push anything.
-    z_ticket = zammad.get_ticket(ticket["zammad_ticket_id"])
-    state_name = zammad.get_ticket_state_name(z_ticket["state_id"])
-    group_name = zammad.get_group_name(z_ticket["group_id"])
+    if ticket.get("lab_session_id"):
+        return lab_tickets.close_lab_ticket(ticket, resolution_notes, state_name, group_name)
+
+    scenario, discoveries, resolution = _sim_resolution(ticket, state_name, group_name)
+
+    if practice:
+        db.update_ticket(ticket_id, status="closed", closed_at=lab_tickets._sqlite_now())
+        return jsonify(_sim_result(db.get_ticket(ticket_id), scenario, discoveries, resolution,
+                                   state_name, group_name, None))
 
     # Fetch articles for timing metrics.
     articles = zammad.get_ticket_articles(ticket["zammad_ticket_id"])
-
-    # Determine which resolution path was taken based on shell discoveries.
-    discoveries = db.get_all_discoveries(ticket_id)
-    scenario = scenario_svc.load_scenario(ticket["scenario_id"])
-    escalated = group_name != "Users" or state_name != "closed"
-    resolution = scenario_svc.get_resolution_path(ticket["scenario_id"], discoveries,
-                                                  escalated=escalated)
 
     # Post the full shell command log as a single internal note so the Zammad
     # ticket record has the diagnostic trail attached without cluttering the live thread.
@@ -223,14 +252,68 @@ def close_ticket(ticket_id):
         state_name, group_name, articles
     )
 
-    db.update_ticket(ticket_id, status="graded")
+    db.update_ticket(ticket_id, status="graded", closed_at=lab_tickets._sqlite_now())
+    return jsonify(_sim_result(db.get_ticket(ticket_id), scenario, discoveries, resolution,
+                               state_name, group_name, result))
 
-    return jsonify({
+
+@tickets_bp.route("/api/tickets/<int:ticket_id>/grade", methods=["POST"])
+def grade_practice(ticket_id):
+    """
+    Practice mode only: send a closed attempt (commands or lab report, resolution choice,
+    notes) to the grading model for a review. Conversation dimensions are left out.
+    Returns the same shape as /close in full mode.
+    """
+    ticket = db.get_ticket(ticket_id)
+    if not ticket:
+        return jsonify({"error": "Ticket not found"}), 404
+    if ticket["mode"] != "practice":
+        return jsonify({"error": "Full-mode tickets are graded at close"}), 400
+    if ticket["status"] != "closed":
+        msg = "Close the ticket first" if ticket["status"] == "open" else "This attempt is already graded"
+        return jsonify({"error": msg}), 400
+
+    if ticket.get("lab_session_id"):
+        return lab_tickets.grade_practice(ticket)
+
+    state_name, group_name = _resolution_choice(ticket)
+    scenario, discoveries, resolution = _sim_resolution(ticket, state_name, group_name)
+    result = _run_grading(ticket, scenario, discoveries, resolution, ticket.get("resolution_notes") or "",
+                          state_name, group_name, [], practice=True)
+    db.update_ticket(ticket_id, status="graded")
+    return jsonify(_sim_result(ticket, scenario, discoveries, resolution, state_name, group_name, result))
+
+
+def _resolution_choice(ticket):
+    """(state, group) the operator chose: read from Zammad for full tickets, from the local
+    row for practice tickets (set by PATCH .../state)."""
+    if ticket["mode"] == "practice":
+        return ticket.get("resolution_state") or "open", ticket.get("resolution_group") or "Users"
+    z_ticket = zammad.get_ticket(ticket["zammad_ticket_id"])
+    return (zammad.get_ticket_state_name(z_ticket["state_id"]),
+            zammad.get_group_name(z_ticket["group_id"]))
+
+
+def _sim_resolution(ticket, state_name, group_name):
+    """Which resolution path the shell discoveries reached (deterministic, so it can be
+    recomputed when a practice attempt is graded later)."""
+    discoveries = db.get_all_discoveries(ticket["id"])
+    scenario = scenario_svc.load_scenario(ticket["scenario_id"])
+    escalated = group_name != "Users" or state_name != "closed"
+    resolution = scenario_svc.get_resolution_path(ticket["scenario_id"], discoveries, escalated=escalated)
+    return scenario, discoveries, resolution
+
+
+def _sim_result(ticket, scenario, discoveries, resolution, state_name, group_name, grading):
+    """Response for close and grade. `grading` is None for a practice close."""
+    return {
+        "mode": ticket["mode"],
         "zammad_state": state_name,
         "zammad_group": group_name,
         "resolution_path": resolution,
-        "grading": result,
-    })
+        "check": checks.sim_check(ticket, scenario, resolution, discoveries),
+        "grading": grading,
+    }
 
 
 @tickets_bp.route("/api/tickets", methods=["GET"])
@@ -278,8 +361,9 @@ def _post_command_log_note(ticket, command_log):
 
 
 def _run_grading(ticket, scenario, discoveries, resolution, resolution_notes,
-                 zammad_state, zammad_group, articles):
-    """Builds the grading prompt, calls the grading model, and saves the result."""
+                 zammad_state, zammad_group, articles, practice=False):
+    """Builds the grading prompt, calls the grading model, and saves the result.
+    practice=True: there was no conversation, so only the technical dimensions are scored."""
     command_log = db.get_command_log(ticket["id"])
     persona = db.get_persona(ticket["id"])
     optimal_path = scenario.get("optimal_path", [])
@@ -315,7 +399,63 @@ def _run_grading(ticket, scenario, discoveries, resolution, resolution_notes,
 
     thread_str = _format_conversation(articles)
 
-    grading_prompt = f"""You are evaluating an IT help desk training exercise. This is a CONSTRAINED SIMULATION. Grade the operator strictly against what was possible within the defined scenario — do not apply real-world expectations that exceed its scope.
+    # The parts that depend on there having been a conversation with the simulated user.
+    if practice:
+        mode_note = ("PRACTICE MODE: the trainee worked this scenario from a written brief, with no simulated end user "
+                     "and no ticket conversation, to practise the technical work. Do not score or comment on customer "
+                     "service, communication or timeliness. Steps that need the user (verifying their identity, asking them to "
+                     "test, telling them it's fixed) were impossible: do not lower any score for their absence. You may "
+                     "mention them in one short sentence as a reminder for the full simulation.\n\n")
+        ticket_side = f"""OPERATOR NOTES AT CLOSE: {resolution_notes or '(none provided)'}"""
+        cs_guidance = ""
+        notes_check = """- CROSS-CHECK THE NOTES: resolution notes are the ticket's permanent record and must be true. A claim that something was checked, changed, fixed or verified must appear in COMMANDS RUN. If any claim is unsupported, quote it in FEEDBACK; invented technical work caps DIAGNOSTIC_ACCURACY at 3. Lower OVERALL to match."""
+        dims = """1. Diagnostic accuracy — Did they correctly identify the root cause, or correctly recognize it exceeded T1 scope?
+2. Diagnostic efficiency — Was their command sequence logical given the AVAILABLE COMMANDS?
+3. Escalation judgment — Did they escalate or resolve appropriately for this scenario type?"""
+        fmt = """DIAGNOSTIC_ACCURACY: <score>/10
+DIAGNOSTIC_EFFICIENCY: <score>/10
+ESCALATION_JUDGMENT: <score>/10
+OVERALL: <score>/100
+NOTES_INVENTED_TECHNICAL_WORK: <yes|no>
+FEEDBACK: <your feedback>"""
+    else:
+        mode_note = ""
+        ticket_side = f"""TIMING METRICS:
+  Time to first response: {timing['ttfr']}
+  Total session time: {timing['session_time']}
+  Persona follow-ups sent unprompted: {persona['follow_up_count'] if persona else 'unknown'}
+
+OPERATOR NOTES AT CLOSE: {resolution_notes or '(none provided)'}
+
+TICKET CONVERSATION THREAD (user = simulated end user, operator = trainee):
+{thread_str}"""
+        cs_guidance = f"""- CUSTOMER_SERVICE: the simulated user's technical literacy was {literacy_desc}. Evaluate language calibration against that level specifically. Do not suggest technical phrasing (IP addresses, config file paths, error codes) as improvements if the user was non-technical — that would be the wrong direction.
+- "Closing the loop" means different things by resolution type:
+    * Direct fix: confirm with the user in plain, non-technical language that the issue is resolved and briefly what was done.
+    * Escalation: inform the user the ticket is being passed to the appropriate team, what they can expect next, and a rough timeline. Do NOT suggest relaying raw technical findings (nameserver values, log excerpts) to the end user — those go to the receiving team, not the customer.
+- If the user declined remote access or preferred to be guided through steps verbally, do not penalize reduced shell activity. Verbal guidance is a valid T1 resolution.
+"""
+        notes_check = """- CROSS-CHECK THE NOTES: resolution notes are the ticket's permanent record and must be true. Check every claim in OPERATOR NOTES AT CLOSE against the thread and COMMANDS RUN:
+    * A claim about what the user said, reported, confirmed or agreed to must appear in a user message in the thread. Permission to make a change is NOT confirmation that the fix worked.
+    * A claim that something was checked, changed, fixed or verified must appear in COMMANDS RUN (or, for verbal guidance, in the thread).
+    * If any claim is unsupported, quote it in FEEDBACK. An invented user confirmation caps CUSTOMER_SERVICE at 4; invented technical work caps DIAGNOSTIC_ACCURACY at 3. Lower OVERALL to match.
+- A direct fix the user was never told about is an unclosed loop: CUSTOMER_SERVICE at most 7."""
+        dims = """1. Diagnostic accuracy — Did they correctly identify the root cause, or correctly recognize it exceeded T1 scope?
+2. Diagnostic efficiency — Was their command sequence logical given the AVAILABLE COMMANDS?
+3. Escalation judgment — Did they escalate or resolve appropriately for this scenario type?
+4. Response timeliness — Based on timing metrics and persona follow-up count.
+5. Customer service — Professionalism, empathy, language calibrated to this user's technical level, and appropriate loop closure for the resolution type."""
+        fmt = """DIAGNOSTIC_ACCURACY: <score>/10
+DIAGNOSTIC_EFFICIENCY: <score>/10
+ESCALATION_JUDGMENT: <score>/10
+RESPONSE_TIMELINESS: <score>/10
+CUSTOMER_SERVICE: <score>/10
+OVERALL: <score>/100
+NOTES_INVENTED_USER_CONFIRMATION: <yes|no>
+NOTES_INVENTED_TECHNICAL_WORK: <yes|no>
+FEEDBACK: <your feedback>"""
+
+    grading_prompt = f"""{mode_note}You are evaluating an IT help desk training exercise. This is a CONSTRAINED SIMULATION. Grade the operator strictly against what was possible within the defined scenario — do not apply real-world expectations that exceed its scope.
 
 SIMULATION CONSTRAINTS:
 - The shell environment is deterministic and pre-scripted. Only the commands in AVAILABLE COMMANDS exist. Anything else returns "command not found."
@@ -343,15 +483,7 @@ ZAMMAD WORKFLOW CONTEXT (supplementary only):
 
 ---
 
-TIMING METRICS:
-  Time to first response: {timing['ttfr']}
-  Total session time: {timing['session_time']}
-  Persona follow-ups sent unprompted: {persona['follow_up_count'] if persona else 'unknown'}
-
-OPERATOR NOTES AT CLOSE: {resolution_notes or '(none provided)'}
-
-TICKET CONVERSATION THREAD (user = simulated end user, operator = trainee):
-{thread_str}
+{ticket_side}
 
 COMMANDS RUN (in order):
 {commands_str}
@@ -363,37 +495,16 @@ GRADING GUIDANCE:
 - DIAGNOSTIC_ACCURACY: score based on the system-determined resolution and discoveries above. Do not contradict the system's determination.
 - DIAGNOSTIC_EFFICIENCY: compare only against AVAILABLE COMMANDS and the OPTIMAL PATH. Do not penalize for omitting commands that weren't in the scenario.
 - ESCALATION_JUDGMENT: if this was a direct-fix scenario, penalize unnecessary escalation. If this was an escalation scenario, penalize attempting a fix. If the resolution modifier is 0.9+, assume judgment was correct.
-- CUSTOMER_SERVICE: the simulated user's technical literacy was {literacy_desc}. Evaluate language calibration against that level specifically. Do not suggest technical phrasing (IP addresses, config file paths, error codes) as improvements if the user was non-technical — that would be the wrong direction.
-- "Closing the loop" means different things by resolution type:
-    * Direct fix: confirm with the user in plain, non-technical language that the issue is resolved and briefly what was done.
-    * Escalation: inform the user the ticket is being passed to the appropriate team, what they can expect next, and a rough timeline. Do NOT suggest relaying raw technical findings (nameserver values, log excerpts) to the end user — those go to the receiving team, not the customer.
-- If the user declined remote access or preferred to be guided through steps verbally, do not penalize reduced shell activity. Verbal guidance is a valid T1 resolution.
-- CROSS-CHECK THE NOTES: resolution notes are the ticket's permanent record and must be true. Check every claim in OPERATOR NOTES AT CLOSE against the thread and COMMANDS RUN:
-    * A claim about what the user said, reported, confirmed or agreed to must appear in a user message in the thread. Permission to make a change is NOT confirmation that the fix worked.
-    * A claim that something was checked, changed, fixed or verified must appear in COMMANDS RUN (or, for verbal guidance, in the thread).
-    * If any claim is unsupported, quote it in FEEDBACK. An invented user confirmation caps CUSTOMER_SERVICE at 4; invented technical work caps DIAGNOSTIC_ACCURACY at 3. Lower OVERALL to match.
-- A direct fix the user was never told about is an unclosed loop: CUSTOMER_SERVICE at most 7.
+{cs_guidance}{notes_check}
 - Be specific in feedback. Reference actual messages or commands. Vague praise or criticism is not useful to the trainee.
 
 Please evaluate on these dimensions and give a score from 0–10 for each:
-1. Diagnostic accuracy — Did they correctly identify the root cause, or correctly recognize it exceeded T1 scope?
-2. Diagnostic efficiency — Was their command sequence logical given the AVAILABLE COMMANDS?
-3. Escalation judgment — Did they escalate or resolve appropriately for this scenario type?
-4. Response timeliness — Based on timing metrics and persona follow-up count.
-5. Customer service — Professionalism, empathy, language calibrated to this user's technical level, and appropriate loop closure for the resolution type.
+{dims}
 
 Then give an overall score from 0–100 and 2–3 sentences of specific, actionable feedback.
 
 Format your response as:
-DIAGNOSTIC_ACCURACY: <score>/10
-DIAGNOSTIC_EFFICIENCY: <score>/10
-ESCALATION_JUDGMENT: <score>/10
-RESPONSE_TIMELINESS: <score>/10
-CUSTOMER_SERVICE: <score>/10
-OVERALL: <score>/100
-NOTES_INVENTED_USER_CONFIRMATION: <yes|no>
-NOTES_INVENTED_TECHNICAL_WORK: <yes|no>
-FEEDBACK: <your feedback>"""
+{fmt}"""
 
     system_prompt = ("You are an experienced IT help desk trainer. "
                      "Provide honest, specific, constructive evaluations. "
@@ -426,7 +537,7 @@ FEEDBACK: <your feedback>"""
     except Exception:
         pass
 
-    _enforce_caps(rubric, resolution, zammad_state, zammad_group, articles, command_log)
+    _enforce_caps(rubric, resolution, zammad_state, zammad_group, articles, command_log, practice)
 
     overall = float(rubric.get("overall_score", "0").split("/")[0]) if "overall_score" in rubric else 0.0
 
@@ -468,7 +579,7 @@ def _cap(rubric, key, limit, reason, notes):
     return current - limit
 
 
-def _enforce_caps(rubric, resolution, zammad_state, zammad_group, articles, command_log):
+def _enforce_caps(rubric, resolution, zammad_state, zammad_group, articles, command_log, practice=False):
     """
     The model reliably notices these problems but doesn't hold to numeric caps, so the
     caps are applied here. Each rubric point removed costs 2 overall points (five items
@@ -485,7 +596,8 @@ def _enforce_caps(rubric, resolution, zammad_state, zammad_group, articles, comm
 
     # Direct fix the user was never told about: no operator message after the last command
     # that revealed something (the fix or its verification). Later idle commands don't count.
-    direct_fix = (zammad_state == "closed" and zammad_group == "Users"
+    # Not in practice mode: there was no user to tell.
+    direct_fix = (not practice and zammad_state == "closed" and zammad_group == "Users"
                   and resolution.get("score_modifier", 0) >= 0.9)
     revealing = [e for e in command_log if e.get("revealed")]
     if direct_fix and revealing:

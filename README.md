@@ -173,6 +173,25 @@ Settings in `.env`: `LAB_URL`, `LAB_API_KEY`, `LAB_PUBLIC` (offer lab scenarios 
 public visitors; requests made directly to the app inside its container can always
 use them), `LAB_PUBLIC_PREFIX` (browser path to the lab consoles, default `/api/lab`).
 
+## Practice mode
+
+For faster practice on the technical side, a session can skip the ticket side entirely.
+`POST /api/tickets` with `{"scenario_id": "...", "mode": "practice"}` creates no Zammad
+ticket, rolls no persona and makes no model calls (lab machines still start). The response
+carries `brief` (the ticket as filed plus what the user would say if asked) in place of
+a conversation; `/thread` and `/reply` return 409.
+
+- `PATCH /api/tickets/<id>/state` stores the close/escalate choice locally.
+- `POST /api/tickets/<id>/close` returns `check`: a programmatic pass/fail built from what
+  the grader already treats as authoritative (scripted: resolution path and the ideal
+  path's discoveries; lab: outcome and before/after machine checks). Passes at
+  `PASS_SCORE` (default 0.9). No grading.
+- `POST /api/tickets/<id>/grade` then optionally sends the attempt to the grading model.
+  Conversation dimensions (customer service, timeliness) are left out.
+
+Full-mode closes return the same `check` alongside the grading. Code: `services/checks.py`,
+`catalog.briefing()`. New scenarios work in both modes without extra fields.
+
 ## Grading dimensions
 
 | Dimension | What it measures |
