@@ -14,14 +14,13 @@ def startup():
     """Runs once when the server starts."""
     db.init_db()
 
-    # Fetch our own Zammad user ID so the scheduler can tell the persona's
-    # articles apart from the operator's.
+    # Connectivity check for the log only. Persona vs operator messages are told apart
+    # by Zammad's sender field, so nothing depends on this succeeding.
     try:
         me = zammad.get_current_user()
-        scheduler.set_ai_user_id(me["id"])
         print(f"[startup] Zammad connected — api user: {me['email']} (id={me['id']})")
     except Exception as e:
-        print(f"[startup] WARNING: Could not reach Zammad: {e}")
+        print(f"[startup] WARNING: Could not reach Zammad yet: {e}")
 
     scheduler.start(app)
     print("[startup] Background scheduler started.")

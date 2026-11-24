@@ -20,20 +20,6 @@ import services.llm as llm
 import services.lab as lab
 from config import SCHEDULER_INTERVAL_SECONDS, CLEANUP_AFTER_HOURS
 
-# Populated on startup with the Zammad user ID of our api account,
-# so we can tell apart our own articles from the operator's articles.
-_ai_user_id = None
-
-
-def set_ai_user_id(user_id):
-    global _ai_user_id
-    _ai_user_id = user_id
-
-
-def get_ai_user_id():
-    return _ai_user_id
-
-
 def start(app):
     """Call once at Flask startup to start the background scheduler."""
     scheduler = BackgroundScheduler()
@@ -81,11 +67,10 @@ def _process_ticket(ticket):
         return
 
     last_article = public_articles[-1]
-    last_author_id = last_article.get("created_by_id")
     last_article_id = last_article["id"]
 
     operator_replied = (
-        last_author_id != _ai_user_id
+        not zammad.is_persona_article(last_article)
         and last_article_id != ticket.get("last_operator_article_id")
     )
 
@@ -144,13 +129,12 @@ def _maybe_follow_up(ticket, persona, public_articles):
 def _build_history(public_articles):
     """
     Converts Zammad articles into the message history format the LLM expects.
-    ai_user articles = persona's own prior messages → "assistant" role.
+    Persona (Customer) articles = its own prior messages → "assistant" role.
     All other articles = operator messages → "user" role (what the persona is responding to).
-    This works correctly because operator replies now use a separate Zammad account.
     """
     history = []
     for article in public_articles:
-        role = "assistant" if article.get("created_by_id") == _ai_user_id else "user"
+        role = "assistant" if zammad.is_persona_article(article) else "user"
         history.append({"role": role, "content": article.get("body", "")})
     return history
 

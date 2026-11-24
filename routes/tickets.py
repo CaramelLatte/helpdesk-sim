@@ -104,7 +104,7 @@ def get_thread(ticket_id):
     messages = []
     for article in public:
         messages.append({
-            "role": "user" if article.get("sender") == "Customer" else "operator",
+            "role": "user" if zammad.is_persona_article(article) else "operator",
             "body": (article.get("body") or "").strip(),
             "timestamp": article.get("created_at"),
             "article_id": article.get("id"),
@@ -489,10 +489,9 @@ def _enforce_caps(rubric, resolution, zammad_state, zammad_group, articles, comm
                   and resolution.get("score_modifier", 0) >= 0.9)
     revealing = [e for e in command_log if e.get("revealed")]
     if direct_fix and revealing:
-        ai_user_id = scheduler.get_ai_user_id()
         last_cmd = _parse_ts(revealing[-1].get("executed_at"))
         told = any(
-            a.get("created_by_id") != ai_user_id and not a.get("internal", False)
+            not zammad.is_persona_article(a) and not a.get("internal", False)
             and (_parse_ts(a.get("created_at")) or last_cmd) > last_cmd
             for a in articles
         )
@@ -513,16 +512,15 @@ def _format_conversation(articles):
     Formats the public ticket thread into a readable transcript for the grading prompt.
     Internal notes (shell logs) are excluded — the grading model gets those separately
     under COMMANDS RUN and shouldn't conflate them with the customer conversation.
-    ai_user articles are the persona; all other authors are the operator.
+    Customer articles are the persona; Agent articles are the operator.
     """
-    ai_user_id = scheduler.get_ai_user_id()
     public = [a for a in articles if not a.get("internal", False)]
     if not public:
         return "  (no conversation — operator did not communicate with the user)"
 
     lines = []
     for article in public:
-        speaker = "user" if article.get("created_by_id") == ai_user_id else "operator"
+        speaker = "user" if zammad.is_persona_article(article) else "operator"
         body = (article.get("body") or "").strip()
         lines.append(f"[{speaker}]: {body}")
 
@@ -534,7 +532,6 @@ def _compute_timing(ticket, articles):
     Derives SLA-style timing metrics from Zammad article timestamps and local DB.
     Returns human-readable strings for the grading prompt.
     """
-    ai_user_id = scheduler.get_ai_user_id()
     public = [a for a in articles if not a.get("internal", False)]
 
     def parse_ts(ts):
@@ -551,7 +548,7 @@ def _compute_timing(ticket, articles):
     # Time to first operator response.
     ttfr_str = "no operator response recorded"
     for article in public:
-        if article.get("created_by_id") != ai_user_id:
+        if not zammad.is_persona_article(article):
             first_op_time = parse_ts(article.get("created_at"))
             if first_op_time and ticket_created:
                 delta = (first_op_time - ticket_created).total_seconds()

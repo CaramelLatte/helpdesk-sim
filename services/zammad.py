@@ -18,6 +18,16 @@ def _url(path):
     return f"{ZAMMAD_URL}/api/v1/{path}"
 
 
+def is_persona_article(article):
+    """
+    True if the simulated end user wrote this article: the ticket body and persona replies
+    are posted with sender "Customer"; operator replies and internal notes with "Agent".
+    Uses Zammad's sender rather than the author's user ID, so it needs no lookup at startup
+    (that lookup used to fail when the sim started before Zammad, mislabelling every message).
+    """
+    return article.get("sender") == "Customer"
+
+
 def get_current_user():
     """Returns the Zammad user record for the API token owner (our ai_user account)."""
     r = requests.get(_url("users/me"), headers=_headers())
@@ -81,8 +91,8 @@ def add_article(zammad_ticket_id, body, internal=False, sender=None):
 def add_article_as_operator(zammad_ticket_id, body):
     """
     Posts a reply on behalf of the human operator, using the operator's own API token.
-    This gives the article a distinct created_by_id so the scheduler can tell it apart
-    from persona messages, which are always posted by the ai_user account.
+    It is posted with sender "Agent", which is how is_persona_article() tells it apart
+    from persona messages.
     """
     payload = {
         "ticket_id": zammad_ticket_id,
